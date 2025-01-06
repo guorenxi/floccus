@@ -60,6 +60,17 @@
         </v-list-item-content>
       </v-list-item>
       <v-list-item
+        key="bugs"
+        link
+        href="https://github.com/floccusaddon/floccus/issues">
+        <v-list-item-icon>
+          <v-icon>mdi-bug-outline</v-icon>
+        </v-list-item-icon>
+        <v-list-item-content>
+          <v-list-item-title>{{ t('LabelReportproblem') }}</v-list-item-title>
+        </v-list-item-content>
+      </v-list-item>
+      <v-list-item
         key="about"
         link
         :to="{name: routes.ABOUT}">
@@ -81,9 +92,11 @@ export default {
   filters: {
     accountIcon(type) {
       const icons = {
-        'google-drive': 'mdi-google-drive',
         'nextcloud-bookmarks': 'mdi-cloud',
-        'webdav': 'mdi-folder-network'
+        'linkwarden': 'mdi-link-box-variant-outline',
+        'webdav': 'mdi-folder-network',
+        'git': 'mdi-source-repository',
+        'google-drive': 'mdi-google-drive'
       }
       return icons[type]
     },

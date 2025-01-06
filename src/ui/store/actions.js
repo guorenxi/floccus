@@ -10,8 +10,8 @@ import { Base64 } from 'js-base64'
 export const actionsDefinition = {
   async [actions.LOAD_LOCKED]({ commit, dispatch, state }) {
     const controller = await Controller.getSingleton()
-    commit(mutations.SET_LOCKED, !controller.unlocked)
-    commit(mutations.SET_SECURED, typeof controller.key === 'string' || !controller.unlocked)
+    const unlocked = await controller.getUnlocked()
+    commit(mutations.SET_LOCKED, !unlocked)
   },
   async [actions.UNLOCK]({commit, dispatch, state}, key) {
     const controller = await Controller.getSingleton()
@@ -22,14 +22,6 @@ export const actionsDefinition = {
       throw e
     }
     commit(mutations.SET_LOCKED, false)
-  },
-  async [actions.SET_KEY]({commit, dispatch, state}, key) {
-    const controller = await Controller.getSingleton()
-    await controller.setKey(key)
-  },
-  async [actions.UNSET_KEY]({commit, dispatch, state}) {
-    const controller = await Controller.getSingleton()
-    await controller.unsetKey()
   },
   async [actions.LOAD_ACCOUNTS]({ commit, dispatch, state }) {
     commit(mutations.LOADING_START, 'accounts')
@@ -77,12 +69,30 @@ export const actionsDefinition = {
   },
   async [actions.STORE_ACCOUNT]({ commit, dispatch, state }, { id,data }) {
     const account = await Account.get(id)
+    const oldData = account.getData()
     await account.setData(data)
+    if (oldData.localRoot !== data.localRoot) {
+      await account.init()
+    }
+    if (oldData.bookmark_file !== data.bookmark_file) {
+      await account.init()
+    }
+    if (oldData.bookmark_file_type !== data.bookmark_file_type) {
+      await account.init()
+    }
     commit(mutations.STORE_ACCOUNT_DATA, {id, data})
   },
   async [actions.TRIGGER_SYNC]({ commit, dispatch, state }, accountId) {
     const controller = await Controller.getSingleton()
     controller.syncAccount(accountId)
+  },
+  async [actions.FORCE_SYNC]({ commit, dispatch, state }, accountId) {
+    const controller = await Controller.getSingleton()
+    controller.syncAccount(accountId, null, true)
+  },
+  async [actions.TRIGGER_SYNC_ALL]({ commit, dispatch, state }, accountId) {
+    const controller = await Controller.getSingleton()
+    controller.scheduleAll()
   },
   async [actions.TRIGGER_SYNC_DOWN]({ commit, dispatch, state }, accountId) {
     const controller = await Controller.getSingleton()
@@ -100,6 +110,7 @@ export const actionsDefinition = {
     await Logger.downloadLogs(anonymous)
   },
   async [actions.TEST_WEBDAV_SERVER]({commit, dispatch, state}, {rootUrl, username, password}) {
+    await dispatch(actions.REQUEST_NETWORK_PERMISSIONS)
     let res = await fetch(`${rootUrl}`, {
       method: 'PROPFIND',
       credentials: 'omit',
@@ -112,14 +123,30 @@ export const actionsDefinition = {
       }
     })
     if (res.status < 200 || res.status > 299) {
-      throw new Error('Could not connect to server: ' + res.status)
+      throw new Error('Could not connect to your webdav server at the specified URL. The server responded with HTTP status ' + res.status + ' to a PROPFIND request with Basic Auth on the URL you entered.')
     }
     return true
   },
   async [actions.TEST_NEXTCLOUD_SERVER]({commit, dispatch, state}, rootUrl) {
+    await dispatch(actions.REQUEST_NETWORK_PERMISSIONS)
     let res = await fetch(`${rootUrl}/index.php/login/v2`, {method: 'POST', headers: {'User-Agent': 'Floccus bookmarks sync'}})
     if (res.status !== 200) {
       throw new Error(browser.i18n.getMessage('LabelLoginFlowError'))
+    }
+    return true
+  },
+  async [actions.TEST_LINKWARDEN_SERVER]({commit, dispatch, state}, {rootUrl, token}) {
+    await dispatch(actions.REQUEST_NETWORK_PERMISSIONS)
+    let res = await fetch(`${rootUrl}/api/v1/collections`, {
+      method: 'GET',
+      credentials: 'omit',
+      headers: {
+        'User-Agent': 'Floccus bookmarks sync',
+        Authorization: 'Bearer ' + token,
+      }
+    })
+    if (res.status !== 200) {
+      throw new Error(browser.i18n.getMessage('LabelLinkwardenconnectionerror'))
     }
     return true
   },
@@ -162,5 +189,19 @@ export const actionsDefinition = {
   },
   async [actions.STOP_LOGIN_FLOW]({commit}) {
     commit(mutations.SET_LOGIN_FLOW_STATE, false)
-  }
+  },
+  async [actions.REQUEST_NETWORK_PERMISSIONS]() {
+    try {
+      await browser.permissions.request({ origins: ['*://*/*'] })
+    } catch (e) {
+      console.warn(e)
+    }
+  },
+  async [actions.REQUEST_HISTORY_PERMISSIONS]() {
+    try {
+      await browser.permissions.request({ permissions: ['history'] })
+    } catch (e) {
+      console.warn(e)
+    }
+  },
 }

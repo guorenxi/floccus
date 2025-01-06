@@ -10,17 +10,14 @@ import { actions } from '../../store/definitions'
 import { routes } from '../../NativeRouter'
 import { SplashScreen } from '@capacitor/splash-screen'
 import { SendIntent } from 'send-intent'
-import Controller from '../../../lib/Controller'
 import packageJson from '../../../../package.json'
-import { Storage } from '@capacitor/storage'
-import { Http } from '@capacitor-community/http'
+import { Preferences as Storage } from '@capacitor/preferences'
+import { CapacitorHttp as Http } from '@capacitor/core'
 import Logger from '../../../lib/Logger'
 
 export default {
   name: 'Home',
   async created() {
-    const controller = await Controller.getSingleton()
-    await controller.onLoad()
     SplashScreen.hide()
     await this.$store.dispatch(actions.LOAD_ACCOUNTS)
 
@@ -56,36 +53,48 @@ export default {
         console.log(e)
         return false
       }
-      if (result.text) {
-        console.log(result.text)
-        let url, title
-        if (result.text.includes('\n')) {
-          [title, , url] = result.text.split('\n', 3)
-        } else {
-          url = result.text
-          try {
-            const response = await Http.get({ url })
-            const parser = new DOMParser()
-            const document = parser.parseFromString(response.data, 'text/html')
-            const titleElement = document.getElementsByTagName('title')[0]
-            if (titleElement) {
-              title = titleElement.textContent
-            }
-          } catch (e) {
-            Logger.log('Failed to fetch shared URL')
-          }
+      let url, title
+      if (!result.url) {
+        if (!result.additionalItems || !result.additionalItems.length) {
+          return false
         }
-        this.$router.push({
-          name: routes.ADD_BOOKMARK,
-          params: {
-            accountId: Object.keys(this.$store.state.accounts)[0],
-            url,
-            title
+        result.additionalItems.forEach(share => {
+          if (!share.url) return
+          url = share.url
+          title = ''
+        })
+      } else {
+        url = result.url
+        title = ''
+      }
+
+      console.log(url)
+      try {
+        const response = await Http.get({ url,
+          headers: {
+            'user-agent': 'curl/8.6.0'
           }
         })
-        return true
+        const parser = new DOMParser()
+        console.log(response.data)
+        const document = parser.parseFromString(response.data, 'text/html')
+        const titleElement = document.getElementsByTagName('title')[0]
+        if (titleElement) {
+          title = titleElement.textContent
+        }
+      } catch (e) {
+        Logger.log('Failed to fetch shared URL')
       }
-      return false
+
+      this.$router.push({
+        name: routes.ADD_BOOKMARK,
+        params: {
+          accountId: Object.keys(this.$store.state.accounts)[0],
+          url,
+          title
+        }
+      })
+      return true
     }
   }
 }

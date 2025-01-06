@@ -1,10 +1,11 @@
 /* global DEBUG */
-import { Device } from '@capacitor/device'
 import util from 'util'
 import * as Parallel from 'async-parallel'
 import packageJson from '../../package.json'
 import Crypto from './Crypto'
 import { Share } from '@capacitor/share'
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
+import { Capacitor } from '@capacitor/core'
 
 export default class Logger {
   static log() {
@@ -16,7 +17,7 @@ export default class Logger {
   }
 
   static async persist() {
-    const Storage = ((await Device.getInfo()).platform === 'web') ? await import('./browser/BrowserAccountStorage') : await import('./native/NativeAccountStorage')
+    const Storage = (Capacitor.getPlatform() === 'web') ? await import('./browser/BrowserAccountStorage') : await import('./native/NativeAccountStorage')
     await Storage.default.changeEntry(
       'logs',
       log => {
@@ -29,13 +30,13 @@ export default class Logger {
   }
 
   static async getLogs() {
-    const Storage = ((await Device.getInfo()).platform === 'web') ? await import('./browser/BrowserAccountStorage') : await import('./native/NativeAccountStorage')
+    const Storage = (Capacitor.getPlatform() === 'web') ? await import('./browser/BrowserAccountStorage') : await import('./native/NativeAccountStorage')
     return Storage.default.getEntry('logs', [])
   }
 
   static async anonymizeLogs(logs) {
     const regex = /\[(.*?)\]\((.*?)\)|\[(.*?)\]/g
-    return Parallel.map(logs, async(entry) => {
+    const newLogs = await Parallel.map(logs, async(entry) => {
       return Logger.replaceAsync(entry, regex, async(match, p1, p2, p3) => {
         if (p1 && p2) {
           const hash1 = await Crypto.sha256(p1)
@@ -47,6 +48,10 @@ export default class Logger {
         }
       })
     }, 1)
+    const regex2 = /url=https?%3A%2F%2F.*$|url=https?%3A%2F%2F[^ ]*/
+    const regex3 = /https?:\/\/[^ /]*\//
+    return newLogs
+      .map(line => line.replace(regex2, '###url###').replace(regex3, '###server###'))
   }
 
   static async replaceAsync(str, regex, asyncFn) {
@@ -79,13 +84,15 @@ export default class Logger {
         packageJson.version +
         '-' +
         new Date().toISOString().slice(0, 10) +
+        '-' +
+        (anonymous ? 'redacted' : 'full') +
         '.log',
       blob
     )
   }
 
   static async download(filename, blob) {
-    if ((await Device.getInfo()).platform === 'web') {
+    if (Capacitor.getPlatform() === 'web') {
       const element = document.createElement('a')
 
       let objectUrl = URL.createObjectURL(blob)
@@ -100,10 +107,16 @@ export default class Logger {
       URL.revokeObjectURL(objectUrl)
       document.body.removeChild(element)
     } else {
+      const {uri: fileURI} = await Filesystem.writeFile({
+        path: 'Downloads/' + filename,
+        data: await blob.text(),
+        encoding: Encoding.UTF8,
+        directory: Directory.External,
+        recursive: true
+      })
       await Share.share({
         title: filename,
-        text: await blob.text(),
-        dialogTitle: 'Share Floccus debug logs',
+        files: [fileURI],
       })
     }
   }

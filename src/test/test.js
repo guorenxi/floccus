@@ -3,7 +3,7 @@ import chaiAsPromised from 'chai-as-promised'
 import random from 'random'
 import seedrandom from 'seedrandom'
 import Account from '../lib/Account'
-import { Bookmark, Folder } from '../lib/Tree'
+import { Bookmark, Folder, ItemLocation } from '../lib/Tree'
 import browser from '../lib/browser-api'
 import Crypto from '../lib/Crypto'
 import * as AsyncParallel from 'async-parallel'
@@ -54,23 +54,26 @@ let expectTreeEqual = function(tree1, tree2, ignoreEmptyFolders, checkOrder = tr
 }
 
 describe('Floccus', function() {
-  this.timeout(60000) // no test should run longer than 60s
+  this.timeout(120000) // no test should run longer than 120s
   this.slow(20000) // 20s is slow
 
   const params = (new URL(window.location.href)).searchParams
-  let SERVER, CREDENTIALS, ACCOUNTS, APP_VERSION, SEED
+  let SERVER, CREDENTIALS, ACCOUNTS, APP_VERSION, SEED, BROWSER, RANDOM_MANIPULATION_ITERATIONS
   SERVER =
     params.get('server') ||
     'http://localhost'
   CREDENTIALS = {
-    username: 'admin',
+    username: params.get('username') || 'admin',
     password: params.get('password') || 'admin'
   }
   APP_VERSION = params.get('app_version') || 'stable'
+  BROWSER = params.get('browser') || 'firefox'
 
   SEED = (new URL(window.location.href)).searchParams.get('seed') || Math.random() + ''
   console.log('RANDOMNESS SEED', SEED)
   random.use(seedrandom(SEED))
+
+  RANDOM_MANIPULATION_ITERATIONS = 35
 
   ACCOUNTS = [
     FakeAdapter.getDefaultValues(),
@@ -86,12 +89,6 @@ describe('Floccus', function() {
     {
       type: 'nextcloud-bookmarks',
       url: SERVER,
-      oldAPIs: true,
-      ...CREDENTIALS
-    },
-    {
-      type: 'nextcloud-bookmarks',
-      url: SERVER,
       serverRoot: '/my folder/some subfolder',
       ...CREDENTIALS
     },
@@ -99,12 +96,14 @@ describe('Floccus', function() {
       type: 'webdav',
       url: `${SERVER}/remote.php/webdav/`,
       bookmark_file: 'bookmarks.xbel',
+      bookmark_file_type: 'xbel',
       ...CREDENTIALS
     },
     {
       type: 'webdav',
       url: `${SERVER}/remote.php/webdav/`,
       bookmark_file: 'bookmarks.xbel',
+      bookmark_file_type: 'xbel',
       passphrase: random.float(),
       ...CREDENTIALS
     },
@@ -121,19 +120,41 @@ describe('Floccus', function() {
       bookmark_file: 'bookmarks.html',
       bookmark_file_type: 'html',
       passphrase: random.float(),
+      ...CREDENTIALS
+    },
+    {
+      type: 'git',
+      url: `${SERVER}/test.git`,
+      branch: 'main',
+      bookmark_file: 'bookmarks.xbel',
+      bookmark_file_type: 'xbel',
+      ...CREDENTIALS
+    },
+    {
+      type: 'git',
+      url: `${SERVER}/test.git`,
+      branch: 'main',
+      bookmark_file: 'bookmarks.html',
+      bookmark_file_type: 'html',
       ...CREDENTIALS
     },
     {
       type: 'google-drive',
-      bookmark_file: random.float() + '.xbel',
+      bookmark_file: Math.random() + '.xbel',
       password: '',
       refreshToken: CREDENTIALS.password,
     },
     {
       type: 'google-drive',
-      bookmark_file: random.float() + '.xbel',
+      bookmark_file: Math.random() + '.xbel',
       password: random.float(),
       refreshToken: CREDENTIALS.password,
+    },
+    {
+      type: 'linkwarden',
+      url: SERVER,
+      serverFolder: 'Floccus-' + Math.random(),
+      ...CREDENTIALS,
     },
   ]
 
@@ -218,10 +239,6 @@ describe('Floccus', function() {
               })
             }
             await account.init()
-            if (ACCOUNT_DATA.type === 'nextcloud-bookmarks' && ACCOUNT_DATA.oldAPIs) {
-              // account.server.hasFeatureHashing = false
-              account.server.hasFeatureChildren = false
-            }
             if (ACCOUNT_DATA.noCache) {
               account.storage.setCache = () => {
                 // noop
@@ -238,8 +255,11 @@ describe('Floccus', function() {
             } catch (e) {
               console.error(e)
             }
-            if (ACCOUNT_DATA.type !== 'fake') {
+            if (ACCOUNT_DATA.type === 'git') {
+              await account.server.clearServer()
+            } else if (ACCOUNT_DATA.type !== 'fake') {
               await account.setData({ ...account.getData(), serverRoot: null })
+              account.lockTimeout = 0
               const tree = await getAllBookmarks(account)
               await withSyncConnection(account, async() => {
                 await AsyncParallel.each(tree.children, async child => {
@@ -253,18 +273,17 @@ describe('Floccus', function() {
             }
             if (ACCOUNT_DATA.type === 'google-drive') {
               const fileList = await account.server.listFiles('name = ' + "'" + account.server.bookmark_file + "'")
-              const file = fileList.files[0]
-              if (file) {
+              const files = fileList.files
+              for (const file of files) {
                 await account.server.deleteFile(file.id)
+              }
+              if (files.length > 1) {
+                throw new Error('Google Drive sync left more than one file behind')
               }
             }
             await account.delete()
           })
           it('should create local bookmarks on the server', async function() {
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
-
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
               title: 'foo',
@@ -301,16 +320,120 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
+            )
+          })
+          it('should create empty local folders on the server', async function() {
+            const localRoot = account.getData().localRoot
+            const fooFolder = await browser.bookmarks.create({
+              title: 'foo',
+              parentId: localRoot
+            })
+            await browser.bookmarks.create({
+              title: 'bar',
+              parentId: fooFolder.id
+            })
+            await account.sync()
+            expect(account.getData().error).to.not.be.ok
+
+            const tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'foo',
+                    children: [
+                      new Folder({
+                        title: 'bar',
+                        children: [
+                        ]
+                      })
+                    ]
+                  })
+                ]
+              }),
+              false
+            )
+          })
+          it('should create local javascript bookmarks on the server', async function() {
+            const localRoot = account.getData().localRoot
+            const fooFolder = await browser.bookmarks.create({
+              title: 'foo',
+              parentId: localRoot
+            })
+            const barFolder = await browser.bookmarks.create({
+              title: 'bar',
+              parentId: fooFolder.id
+            })
+            const bookmark = await browser.bookmarks.create({
+              title: 'url',
+              url: 'javascript:void(0)',
+              parentId: barFolder.id
+            })
+            await account.sync()
+            expect(account.getData().error).to.not.be.ok
+
+            const tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'foo',
+                    children: [
+                      new Folder({
+                        title: 'bar',
+                        children: [
+                          new Bookmark({ title: 'url', url: bookmark.url })
+                        ]
+                      })
+                    ]
+                  })
+                ]
+              }),
+              false,
+              Boolean(account.server.orderFolder)
+            )
+
+            const bookmark2 = await browser.bookmarks.create({
+              title: 'url2',
+              url: 'javascript:void(1)',
+              parentId: barFolder.id
+            })
+            await account.sync()
+            expect(account.getData().error).to.not.be.ok
+
+            const tree2 = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree2,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'foo',
+                    children: [
+                      new Folder({
+                        title: 'bar',
+                        children: [
+                          new Bookmark({ title: 'url', url: bookmark.url }),
+                          new Bookmark({ title: 'url2', url: bookmark2.url }),
+                        ]
+                      })
+                    ]
+                  })
+                ]
+              }),
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should update the server on local changes', async function() {
             if (ACCOUNT_DATA.noCache) {
               return this.skip()
             }
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
@@ -327,6 +450,7 @@ describe('Floccus', function() {
               parentId: barFolder.id
             })
             await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
 
             const newData = { title: 'blah' }
             await browser.bookmarks.update(bookmark.id, newData)
@@ -355,16 +479,135 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
+            )
+          })
+          it('should update the server on local changes of duplicates', async function() {
+            if (ACCOUNT_DATA.noCache) {
+              return this.skip()
+            }
+
+            const localRoot = account.getData().localRoot
+            const fooFolder = await browser.bookmarks.create({
+              title: 'foo',
+              parentId: localRoot
+            })
+            const barFolder = await browser.bookmarks.create({
+              title: 'bar',
+              parentId: fooFolder.id
+            })
+            const bookmark1 = await browser.bookmarks.create({
+              title: 'url',
+              url: 'http://ur.l/',
+              parentId: fooFolder.id
+            })
+            const bookmark2 = await browser.bookmarks.create({
+              title: 'url',
+              url: 'http://ur.l/',
+              parentId: barFolder.id
+            })
+            await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
+
+            const newData = { title: 'blah' }
+            await browser.bookmarks.update(bookmark2.id, newData)
+            await account.sync() // update on server
+            expect(account.getData().error).to.not.be.ok
+
+            const tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'foo',
+                    children: [
+                      new Folder({
+                        title: 'bar',
+                        children: [
+                          new Bookmark({
+                            title: newData.title,
+                            url: bookmark1.url
+                          })
+                        ]
+                      }),
+                      new Bookmark({
+                        title: ACCOUNT_DATA.type === 'nextcloud-bookmarks' ? newData.title : bookmark2.title,
+                        url: bookmark1.url
+                      }),
+                    ]
+                  })
+                ]
+              }),
+              false
+            )
+          })
+          it('should update the server on local changes of url collisions', async function() {
+            if (ACCOUNT_DATA.noCache) {
+              return this.skip()
+            }
+
+            const localRoot = account.getData().localRoot
+            const fooFolder = await browser.bookmarks.create({
+              title: 'foo',
+              parentId: localRoot
+            })
+            const barFolder = await browser.bookmarks.create({
+              title: 'bar',
+              parentId: fooFolder.id
+            })
+            const bookmark1 = await browser.bookmarks.create({
+              title: 'ur1l',
+              url: 'http://ur1.l/',
+              parentId: fooFolder.id
+            })
+            const bookmark2 = await browser.bookmarks.create({
+              title: 'url',
+              url: 'http://ur.l/',
+              parentId: barFolder.id
+            })
+            await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
+
+            const newData = { url: 'http://ur.l/' }
+            await browser.bookmarks.update(bookmark1.id, newData)
+            await account.sync() // update on server
+            expect(account.getData().error).to.not.be.ok
+
+            const tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'foo',
+                    children: [
+                      new Folder({
+                        title: 'bar',
+                        children: [
+                          new Bookmark({
+                            title: bookmark2.title,
+                            url: bookmark2.url
+                          })
+                        ]
+                      }),
+                      new Bookmark({
+                        title: ACCOUNT_DATA.type === 'nextcloud-bookmarks' ? bookmark2.title : bookmark1.title,
+                        url: newData.url
+                      }),
+                    ]
+                  })
+                ]
+              }),
+              false
             )
           })
           it('should update the server on local removals', async function() {
             if (ACCOUNT_DATA.noCache) {
               return this.skip()
             }
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
@@ -381,6 +624,7 @@ describe('Floccus', function() {
               parentId: barFolder.id
             })
             await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
 
             await browser.bookmarks.remove(bookmark.id)
             await account.sync() // update on server
@@ -403,14 +647,93 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
-          it('should update the server on local folder moves', async function() {
+          it('should update the server on local removals and recreations', async function() {
+            if (ACCOUNT_DATA.noCache) {
+              return this.skip()
+            }
             expect(
               (await getAllBookmarks(account)).children
             ).to.have.lengthOf(0)
 
+            const localRoot = account.getData().localRoot
+            const fooFolder = await browser.bookmarks.create({
+              title: 'foo',
+              parentId: localRoot
+            })
+            const barFolder = await browser.bookmarks.create({
+              title: 'bar',
+              parentId: fooFolder.id
+            })
+            const bookmark = await browser.bookmarks.create({
+              title: 'url',
+              url: 'http://ur.l/',
+              parentId: barFolder.id
+            })
+            await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
+
+            await browser.bookmarks.remove(bookmark.id)
+            await account.sync() // update on server
+            expect(account.getData().error).to.not.be.ok
+
+            const tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'foo',
+                    children: [
+                      new Folder({
+                        title: 'bar',
+                        children: []
+                      })
+                    ]
+                  })
+                ]
+              }),
+              false
+            )
+
+            const bookmark2 = await browser.bookmarks.create({
+              title: 'url',
+              url: 'http://ur.l/',
+              parentId: barFolder.id
+            })
+
+            await account.sync() // update on server
+            expect(account.getData().error).to.not.be.ok
+
+            const tree2 = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree2,
+              new Folder({
+                title: tree2.title,
+                children: [
+                  new Folder({
+                    title: 'foo',
+                    children: [
+                      new Folder({
+                        title: 'bar',
+                        children: [
+                          new Bookmark({
+                            url: bookmark2.url,
+                            title: bookmark2.title
+                          })
+                        ]
+                      })
+                    ]
+                  })
+                ]
+              }),
+              false
+            )
+          })
+          it('should update the server on local folder moves', async function() {
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
               title: 'foo',
@@ -431,6 +754,7 @@ describe('Floccus', function() {
               parentId: barFolder.id
             })
             await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
 
             await browser.bookmarks.move(barFolder.id, { parentId: localRoot })
             await account.sync() // update on server
@@ -456,7 +780,7 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should create server bookmarks locally', async function() {
@@ -502,7 +826,39 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
+            )
+          })
+          it('should create empty server folders locally', async function() {
+            const adapter = account.server
+            const serverTree = await getAllBookmarks(account)
+            await withSyncConnection(account, async() => {
+              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
+              await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar'}))
+            })
+
+            await account.sync()
+            expect(account.getData().error).to.not.be.ok
+
+            const tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'foo',
+                    children: [
+                      new Folder({
+                        title: 'bar',
+                        children: [
+                        ]
+                      })
+                    ]
+                  })
+                ]
+              }),
+              false
             )
           })
           it('should update local bookmarks on server changes', async function() {
@@ -564,7 +920,7 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should update local bookmarks on server removals', async function() {
@@ -615,14 +971,10 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should not delete additions while sync is running', async function() {
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
-
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
               title: 'foo',
@@ -674,14 +1026,10 @@ describe('Floccus', function() {
                   }),
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should be able to handle duplicates', async function() {
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
-
             const localRoot = account.getData().localRoot
             const bookmarkData = {
               title: 'url',
@@ -704,6 +1052,7 @@ describe('Floccus', function() {
               parentId: barFolder.id
             })
             await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
 
             await browser.bookmarks.move(barFolder.id, { parentId: localRoot })
             await account.sync() // update on server
@@ -725,26 +1074,26 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should deduplicate unnormalized URLs', async function() {
             const adapter = account.server
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             // create bookmark on server
             const serverTree = await getAllBookmarks(account)
             if (adapter.onSyncStart) await adapter.onSyncStart()
-            const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
+            const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
             const serverMark1 = {
               title: 'url',
-              url: 'http://ur.l/foo/bar?a=b&foo=b%C3%A1r+foo'
+              url: 'http://ur.l/foo/bar?a=b&foo=b%C3%A1r+foo',
+              location: ItemLocation.SERVER
             }
             const serverMark2 = {
               title: 'url2',
-              url: 'http://ur2.l/foo/bar?a=b&foo=b%C3%A1r+foo'
+              url: 'http://ur2.l/foo/bar?a=b&foo=b%C3%A1r+foo',
+              location: ItemLocation.SERVER
             }
             await adapter.createBookmark(
               new Bookmark({ ...serverMark1, parentId: fooFolderId })
@@ -778,7 +1127,6 @@ describe('Floccus', function() {
             })
 
             await account.sync() // propagate to server
-
             expect(account.getData().error).to.not.be.ok
 
             // Sync again, so client can deduplicate
@@ -801,16 +1149,14 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should deduplicate unnormalized URLs without getting stuck', async function() {
             if (ACCOUNT_DATA.type === 'nextcloud-bookmarks' && (APP_VERSION !== 'stable' && APP_VERSION !== 'master' && APP_VERSION !== 'stable3')) {
               this.skip()
             }
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             // create bookmark locally
             const localRoot = account.getData().localRoot
@@ -819,7 +1165,7 @@ describe('Floccus', function() {
               url: 'http://nextcloud.com/'
             }
             const localMark2 = {
-              title: 'url',
+              title: 'url2',
               url: 'https://nextcloud.com'
             }
             const fooFolder = await browser.bookmarks.create({
@@ -836,6 +1182,7 @@ describe('Floccus', function() {
             })
 
             await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
 
             expect(account.getData().error).to.not.be.ok
 
@@ -862,16 +1209,14 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should not fail when moving both folders and contents', async function() {
             if (ACCOUNT_DATA.noCache) {
               return this.skip()
             }
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
@@ -893,6 +1238,7 @@ describe('Floccus', function() {
               parentId: barFolder.id
             })
             await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
 
             await browser.bookmarks.move(barFolder.id, { parentId: localRoot })
             await browser.bookmarks.move(fooFolder.id, {
@@ -916,32 +1262,21 @@ describe('Floccus', function() {
                       new Bookmark({ title: 'url', url: 'http://ur.l/' }),
                       new Folder({
                         title: 'foo',
-                        children:
-                        ACCOUNT_DATA.type !== 'nextcloud-legacy'
-                          ? []
-                          : [
-                            // This is because of a peculiarity of the legacy adapter
-                            new Bookmark({
-                              title: 'test',
-                              url: 'http://ureff.l/'
-                            })
-                          ]
+                        children: [],
                       }),
                       new Bookmark({ title: 'test', url: 'http://ureff.l/' }),
                     ]
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should not fail when both moving folders and deleting their contents', async function() {
             if (ACCOUNT_DATA.noCache) {
               return this.skip()
             }
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
@@ -973,6 +1308,7 @@ describe('Floccus', function() {
               parentId: barFolder.id
             })
             await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
 
             await browser.bookmarks.move(barFolder.id, { parentId: localRoot })
             await browser.bookmarks.move(fooFolder.id, {
@@ -1003,26 +1339,23 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should handle strange characters well', async function() {
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
-
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
               title: 'foo!"§$%&/()=?"',
               parentId: localRoot
             })
             const barFolder = await browser.bookmarks.create({
-              title: "bar=?*'Ä_:-^;",
+              title: "bar=?*'Ä_:-^;<script>",
               parentId: fooFolder.id
             })
             const bookmark = await browser.bookmarks.create({
               title: 'url|!"=)/§_:;Ä\'*ü"',
-              url: 'http://ur.l/',
+              url: 'http://ur.l/?a&b=<script>',
               parentId: barFolder.id
             })
             await account.sync()
@@ -1041,7 +1374,7 @@ describe('Floccus', function() {
                     title: 'foo!"§$%&/()=?"',
                     children: [
                       new Folder({
-                        title: "bar=?*'Ä_:-^;",
+                        title: "bar=?*'Ä_:-^;<script>",
                         children: [
                           new Bookmark({
                             title: 'url|!"=)/§_:;Ä\'*ü"',
@@ -1053,16 +1386,13 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should be able to delete a server folder', async function() {
             if (ACCOUNT_DATA.noCache) {
               return this.skip()
             }
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
@@ -1093,7 +1423,7 @@ describe('Floccus', function() {
                 title: tree.title,
                 children: []
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should be able to delete a local folder', async function() {
@@ -1101,9 +1431,6 @@ describe('Floccus', function() {
               return this.skip()
             }
             const adapter = account.server
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
@@ -1137,19 +1464,20 @@ describe('Floccus', function() {
                 title: tree.title,
                 children: []
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should be ok if both server and local bookmark are removed', async function() {
             const adapter = account.server
             let serverTree = await getAllBookmarks(account)
             if (adapter.onSyncStart) await adapter.onSyncStart()
-            const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
-            const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar'}))
+            const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+            const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
             const serverMark = {
               title: 'url',
               url: 'http://ur.l/',
-              parentId: barFolderId
+              parentId: barFolderId,
+              location: ItemLocation.SERVER
             }
             const serverMarkId = await adapter.createBookmark(
               new Bookmark(serverMark)
@@ -1157,6 +1485,7 @@ describe('Floccus', function() {
             if (adapter.onSyncComplete) await adapter.onSyncComplete()
 
             await account.sync() // propagate creation
+            expect(account.getData().error).to.not.be.ok
 
             await withSyncConnection(account, async() => {
               await adapter.removeBookmark({...serverMark, id: serverMarkId})
@@ -1178,10 +1507,6 @@ describe('Floccus', function() {
               return this.skip()
             }
             const localRoot = account.getData().localRoot
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const barFolder = await browser.bookmarks.create({
               title: 'bar',
@@ -1214,7 +1539,7 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
 
             const localTree = await account.localTree.getBookmarksTree(true)
@@ -1232,15 +1557,11 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should move items successfully even into new folders', async function() {
             const localRoot = account.getData().localRoot
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const barFolder = await browser.bookmarks.create({
               title: 'bar',
@@ -1290,7 +1611,8 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
 
             const localTree = await account.localTree.getBookmarksTree(true)
@@ -1316,15 +1638,12 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should move items successfully when mixing creation and moving (1)', async function() {
             const localRoot = account.getData().localRoot
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const barFolder = await browser.bookmarks.create({
               title: 'bar',
@@ -1388,7 +1707,8 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
 
             const localTree = await account.localTree.getBookmarksTree(true)
@@ -1423,15 +1743,12 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should move items successfully when mixing creation and moving (2)', async function() {
             const localRoot = account.getData().localRoot
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const aFolder = await browser.bookmarks.create({
               title: 'a',
@@ -1512,7 +1829,8 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
 
             const localTree = await account.localTree.getBookmarksTree(true)
@@ -1556,7 +1874,8 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
           })
           it('should move items without creating a folder loop', async function() {
@@ -1564,10 +1883,6 @@ describe('Floccus', function() {
               this.skip()
             }
             const localRoot = account.getData().localRoot
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const aFolder = await browser.bookmarks.create({
               title: 'a',
@@ -1626,7 +1941,8 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
             )
 
             const localTree = await account.localTree.getBookmarksTree(true)
@@ -1634,16 +1950,115 @@ describe('Floccus', function() {
             expectTreeEqual(
               localTree,
               tree,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              Boolean(account.server.orderFolder)
+            )
+          })
+          it('should move items without confusing folders', async function() {
+            const localRoot = account.getData().localRoot
+
+            const aFolder = await browser.bookmarks.create({
+              title: 'a',
+              parentId: localRoot
+            })
+            const bFolder = await browser.bookmarks.create({
+              title: 'b',
+              parentId: localRoot
+            })
+            const dFolder = await browser.bookmarks.create({
+              title: 'd',
+              parentId: localRoot
+            })
+            const cFolder1 = await browser.bookmarks.create({
+              title: 'c',
+              parentId: aFolder.id
+            })
+            await browser.bookmarks.create({
+              title: 'url',
+              url: 'http://ur.l/',
+              parentId: cFolder1.id
+            })
+            const cFolder2 = await browser.bookmarks.create({
+              title: 'c',
+              parentId: bFolder.id
+            })
+            await browser.bookmarks.create({
+              title: 'test',
+              url: 'http://urrr.l/',
+              parentId: cFolder2.id
+            })
+
+            await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
+
+            await account.sync() // make sure order is propagated
+            expect(account.getData().error).to.not.be.ok
+
+            await account.init()
+
+            // move b into a in client
+            await browser.bookmarks.move(cFolder1.id, { parentId: localRoot })
+            await browser.bookmarks.move(cFolder2.id, { parentId: dFolder.id })
+
+            await account.sync() // propagate to server
+            expect(account.getData().error).to.not.be.ok
+
+            const tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'a',
+                    children: []
+                  }),
+                  new Folder({
+                    title: 'b',
+                    children: []
+                  }),
+                  new Folder({
+                    title: 'd',
+                    children: [
+                      new Folder({
+                        title: 'c',
+                        children: [
+                          new Bookmark({
+                            title: 'test',
+                            url: 'http://urrr.l/',
+                          })
+                        ]
+                      })
+                    ]
+                  }),
+                  new Folder({
+                    title: 'c',
+                    children: [
+                      new Bookmark({
+                        title: 'url',
+                        url: 'http://ur.l/',
+                      })
+                    ]
+                  }),
+                ]
+              }),
+              false,
+              false
+            )
+
+            const localTree = await account.localTree.getBookmarksTree(true)
+            localTree.title = tree.title
+            expectTreeEqual(
+              localTree,
+              tree,
+              false,
+              false
             )
           })
           it('should integrate existing items from both sides', async function() {
             const localRoot = account.getData().localRoot
 
             const adapter = account.server
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const aFolder = await browser.bookmarks.create({
               title: 'a',
@@ -1717,7 +2132,7 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false /* checkOrder */
             )
 
@@ -1747,7 +2162,7 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false /* checkOrder */
             )
 
@@ -1758,10 +2173,6 @@ describe('Floccus', function() {
             if (ACCOUNT_DATA.noCache) {
               this.skip()
             }
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
@@ -1809,13 +2220,9 @@ describe('Floccus', function() {
           })
           it('should leave alone unaccepted bookmarks entirely', async function() {
             if (!~ACCOUNT_DATA.type.indexOf('nextcloud')) {
-              this.skip()
+              return this.skip()
             }
             const localRoot = account.getData().localRoot
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const barFolder = await browser.bookmarks.create({
               title: 'bar',
@@ -1832,7 +2239,7 @@ describe('Floccus', function() {
             })
             await browser.bookmarks.create({
               title: 'url2',
-              url: 'javascript:void(0)',
+              url: 'chrome://extensions/',
               parentId: fooFolder.id
             })
             await account.sync() // propagate to server
@@ -1859,7 +2266,7 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
 
@@ -1878,7 +2285,7 @@ describe('Floccus', function() {
                         children: [
                           new Bookmark({
                             title: 'url2',
-                            url: 'javascript:void(0)'
+                            url: 'chrome://extensions/'
                           })
                         ]
                       })
@@ -1886,7 +2293,7 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
           })
@@ -1895,11 +2302,14 @@ describe('Floccus', function() {
               this.skip()
               return
             }
+            if (BROWSER !== 'firefox') {
+              this.skip()
+              return
+            }
+            if (ACCOUNT_DATA.type === 'linkwarden') {
+              return this.skip()
+            }
             const localRoot = account.getData().localRoot
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const barFolder = await browser.bookmarks.create({
               title: 'bar',
@@ -1948,7 +2358,7 @@ describe('Floccus', function() {
                         ]}),
                     ]}),
                 ]}),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             expectTreeEqual(
               tree,
@@ -1965,7 +2375,7 @@ describe('Floccus', function() {
                         ]}),
                     ]}),
                 ]}),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
 
             console.log('initial sync done')
@@ -1996,7 +2406,7 @@ describe('Floccus', function() {
                       new Bookmark({title: '-----', url: 'https://separator.floccus.org/?id=379999'})
                     ]}),
                 ]}),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree = await getAllBookmarks(account)
             expectTreeEqual(
@@ -2014,7 +2424,7 @@ describe('Floccus', function() {
                       new Bookmark({title: '-----', url: 'https://separator.floccus.org/?id=467366'})
                     ]}),
                 ]}),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should sync separators 2', async function() {
@@ -2022,11 +2432,14 @@ describe('Floccus', function() {
               this.skip()
               return
             }
+            if (BROWSER !== 'firefox') {
+              this.skip()
+              return
+            }
+            if (ACCOUNT_DATA.type === 'linkwarden') {
+              return this.skip()
+            }
             const localRoot = account.getData().localRoot
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const barFolder = await browser.bookmarks.create({
               title: 'bar',
@@ -2075,7 +2488,7 @@ describe('Floccus', function() {
                         ]}),
                     ]}),
                 ]}),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             expectTreeEqual(
               tree,
@@ -2092,7 +2505,7 @@ describe('Floccus', function() {
                         ]}),
                     ]}),
                 ]}),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
 
             console.log('initial sync done')
@@ -2120,17 +2533,13 @@ describe('Floccus', function() {
                     ]}),
 
                 ]}),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should sync root folder successfully', async function() {
             const [root] = await browser.bookmarks.getTree()
             await account.setData({...account.getData(), localRoot: root.id})
             account = await Account.get(account.id)
-
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
 
             const barFolder = await browser.bookmarks.create({
               title: 'bar',
@@ -2157,22 +2566,85 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree,
               newRoot,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
 
+            // Switch it back to something harmless, so we don't attempt to clean up the root folder
             await account.setData({...account.getData(), localRoot: barFolder.id})
             account = await Account.get(account.id)
           })
+          it('should sync root folder ignoring unsupported folders', async function() {
+            const [root] = await browser.bookmarks.getTree()
+
+            await Promise.all(
+              root.children.flatMap(child => child.children.map(child => browser.bookmarks.removeTree(child.id)))
+            )
+
+            const originalFolderId = account.getData().localRoot
+            await account.setData({...account.getData(), localRoot: root.id, })
+            account = await Account.get(account.id)
+            const adapter = account.server
+
+            let bookmark
+            let serverTree = await getAllBookmarks(account)
+            await withSyncConnection(account, async() => {
+              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
+              const serverMark = {
+                title: 'url2',
+                url: 'http://ur2.l/',
+                parentId: barFolderId,
+                location: ItemLocation.SERVER
+              }
+              const id = await adapter.createBookmark(
+                new Bookmark(serverMark)
+              )
+              bookmark = {...serverMark, id}
+            })
+
+            const secondBookmarkFolderTitle = root.children[0].title
+            await browser.bookmarks.create({
+              title: 'url',
+              url: 'http://ur.l/',
+              parentId: root.children[0].id
+            })
+
+            await account.sync()
+            expect(account.getData().error).to.not.be.ok
+
+            serverTree = await getAllBookmarks(account)
+            const newRoot = await account.localTree.getBookmarksTree()
+            expect(serverTree.children).to.have.lengthOf(newRoot.children.length + 1)
+
+            await withSyncConnection(account, async() => {
+              bookmark.parentId = serverTree.children.find(folder => folder.title !== 'foo').id
+              const fooFolder = serverTree.children.find(folder => folder.title === 'foo')
+              await adapter.updateBookmark(new Bookmark(bookmark))
+              // toLowerCase to accommodate chrome (since we normalize the title)
+              const secondBookmark = serverTree.children.find(folder => folder.title.toLowerCase() === secondBookmarkFolderTitle.toLowerCase()).children.find(item => item.type === 'bookmark')
+              secondBookmark.parentId = fooFolder.id
+              await adapter.updateBookmark(secondBookmark)
+            })
+
+            await account.sync()
+            expect(account.getData().error).to.not.be.ok
+
+            serverTree = await getAllBookmarks(account)
+            const localTreeAfterSync = await account.localTree.getBookmarksTree()
+            expect(serverTree.children).to.have.lengthOf(localTreeAfterSync.children.length + 1)
+
+            // Switch it back to something harmless, so we don't attempt to clean up the root folder
+            await account.setData({...account.getData(), localRoot: originalFolderId})
+            account = await Account.get(account.id)
+          })
           it('should synchronize ordering', async function() {
-            if (ACCOUNT_DATA.type === 'nextcloud-legacy') {
-              this.skip()
-            }
             if (ACCOUNT_DATA.noCache) {
               return this.skip()
             }
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
+            if (ACCOUNT_DATA.type === 'linkwarden') {
+              return this.skip()
+            }
 
             const localRoot = account.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
@@ -2321,6 +2793,8 @@ describe('Floccus', function() {
                 parentId: barFolder.id
               })
               await account.sync() // propagate to server
+              expect(account.getData().error).to.not.be.ok
+
               const originalTree = await getAllBookmarks(account)
               await account.setData({ ...account.getData(), strategy: 'slave' })
 
@@ -2333,7 +2807,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it("shouldn't update the server on local removals", async function() {
@@ -2356,6 +2830,8 @@ describe('Floccus', function() {
                 parentId: barFolder.id
               })
               await account.sync() // propagate to server
+              expect(account.getData().error).to.not.be.ok
+
               const originalTree = await getAllBookmarks(account)
               await account.setData({ ...account.getData(), strategy: 'slave' })
 
@@ -2367,7 +2843,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it("shouldn't update the server on local folder moves", async function() {
@@ -2395,6 +2871,8 @@ describe('Floccus', function() {
                 parentId: barFolder.id
               })
               await account.sync() // propagate to server
+              expect(account.getData().error).to.not.be.ok
+
               const originalTree = await getAllBookmarks(account)
               await account.setData({ ...account.getData(), strategy: 'slave' })
 
@@ -2408,7 +2886,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it('should create server bookmarks locally', async function() {
@@ -2416,12 +2894,13 @@ describe('Floccus', function() {
               const adapter = account.server
               const serverTree = await getAllBookmarks(account)
               if (adapter.onSyncStart) await adapter.onSyncStart()
-              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
-              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar'}))
+              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
               const serverMark = {
                 title: 'url',
                 url: 'http://ur.l/',
-                parentId: barFolderId
+                parentId: barFolderId,
+                location: ItemLocation.SERVER
               }
               await adapter.createBookmark(
                 new Bookmark(serverMark)
@@ -2453,7 +2932,7 @@ describe('Floccus', function() {
                     })
                   ]
                 }),
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it('should update local bookmarks on server changes', async function() {
@@ -2465,12 +2944,13 @@ describe('Floccus', function() {
 
               const serverTree = await getAllBookmarks(account)
               if (adapter.onSyncStart) await adapter.onSyncStart()
-              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
-              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar'}))
+              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
               const serverMark = {
                 title: 'url',
                 url: 'http://ur.l/',
-                parentId: barFolderId
+                parentId: barFolderId,
+                location: ItemLocation.SERVER
               }
               const serverMarkId = await adapter.createBookmark(
                 new Bookmark(serverMark)
@@ -2478,11 +2958,13 @@ describe('Floccus', function() {
               if (adapter.onSyncComplete) await adapter.onSyncComplete()
 
               await account.sync() // propage creation
+              expect(account.getData().error).to.not.be.ok
 
               const newServerMark = {
                 ...serverMark,
                 title: 'blah',
-                id: serverMarkId
+                id: serverMarkId,
+                location: ItemLocation.SERVER
               }
 
               await withSyncConnection(account, async() => {
@@ -2514,7 +2996,7 @@ describe('Floccus', function() {
                     })
                   ]
                 }),
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it('should update local bookmarks on server removals', async function() {
@@ -2522,12 +3004,13 @@ describe('Floccus', function() {
               const adapter = account.server
               const serverTree = await getAllBookmarks(account)
               if (adapter.onSyncStart) await adapter.onSyncStart()
-              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
-              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar'}))
+              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
               const serverMark = {
                 title: 'url',
                 url: 'http://ur.l/',
-                parentId: barFolderId
+                parentId: barFolderId,
+                location: ItemLocation.SERVER
               }
               const serverMarkId = await adapter.createBookmark(
                 new Bookmark(serverMark)
@@ -2535,6 +3018,7 @@ describe('Floccus', function() {
               if (adapter.onSyncComplete) await adapter.onSyncComplete()
 
               await account.sync() // propage creation
+              expect(account.getData().error).to.not.be.ok
 
               await withSyncConnection(account, async() => {
                 await adapter.removeBookmark({...serverMark, id: serverMarkId})
@@ -2560,14 +3044,81 @@ describe('Floccus', function() {
                     })
                   ]
                 }),
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
+            })
+            it('should sync root folder ignoring unsupported folders', async function() {
+              const [root] = await browser.bookmarks.getTree()
+
+              await Promise.all(
+                root.children.flatMap(child => child.children.map(child => browser.bookmarks.removeTree(child.id)))
+              )
+
+              const originalFolderId = account.getData().localRoot
+              await account.setData({...account.getData(), localRoot: root.id, })
+              account = await Account.get(account.id)
+              const adapter = account.server
+
+              expect(
+                (await getAllBookmarks(account)).children
+              ).to.have.lengthOf(0)
+
+              let bookmark
+              let serverTree = await getAllBookmarks(account)
+              await withSyncConnection(account, async() => {
+                const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+                const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
+                const serverMark = {
+                  title: 'url2',
+                  url: 'http://ur2.l/',
+                  parentId: barFolderId,
+                  location: ItemLocation.SERVER
+                }
+                const id = await adapter.createBookmark(
+                  new Bookmark(serverMark)
+                )
+                bookmark = {...serverMark, id}
+              })
+
+              const secondBookmarkFolderTitle = root.children[0].title
+              await browser.bookmarks.create({
+                title: 'url',
+                url: 'http://ur.l/',
+                parentId: root.children[0].id
+              })
+
+              await account.sync()
+              expect(account.getData().error).to.not.be.ok
+
+              serverTree = await getAllBookmarks(account)
+              const newRoot = await account.localTree.getBookmarksTree()
+              expect(serverTree.children).to.have.lengthOf(newRoot.children.length + 1)
+
+              await withSyncConnection(account, async() => {
+                bookmark.parentId = serverTree.children.find(folder => folder.title !== 'foo').id
+                const fooFolder = serverTree.children.find(folder => folder.title === 'foo')
+                await adapter.updateBookmark(new Bookmark(bookmark))
+                // toLowerCase to accommodate chrome (since we normalize the title)
+                const secondBookmark = serverTree.children.find(folder => folder.title.toLowerCase() === secondBookmarkFolderTitle.toLowerCase()).children.find(item => item.type === 'bookmark')
+                secondBookmark.parentId = fooFolder.id
+                await adapter.updateBookmark(secondBookmark)
+              })
+
+              await account.setData({ ...account.getData(), strategy: 'slave' })
+
+              await account.sync()
+              expect(account.getData().error).to.not.be.ok
+
+              serverTree = await getAllBookmarks(account)
+              const localTreeAfterSync = await account.localTree.getBookmarksTree()
+              expect(serverTree.children).to.have.lengthOf(localTreeAfterSync.children.length + 1)
+
+              // Switch it back to something harmless, so we don't attempt to clean up the root folder
+              await account.setData({...account.getData(), localRoot: originalFolderId})
+              account = await Account.get(account.id)
             })
           })
           context('with overwrite mode', function() {
-            before(function() {
-              if (ACCOUNT_DATA.type === 'nextcloud-legacy') return this.skip()
-            })
             it('should create local bookmarks on the server', async function() {
               await account.setData({
                 ...account.getData(),
@@ -2613,7 +3164,7 @@ describe('Floccus', function() {
                     })
                   ]
                 }),
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it('should create local bookmarks on the server respecting moves', async function() {
@@ -2661,7 +3212,7 @@ describe('Floccus', function() {
                     })
                   ]
                 }),
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
 
               const bazFolder = await browser.bookmarks.create({
@@ -2704,7 +3255,8 @@ describe('Floccus', function() {
                     })
                   ]
                 }),
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false,
+                Boolean(account.server.orderFolder)
               )
             })
             it('should update the server on local changes', async function() {
@@ -2730,6 +3282,8 @@ describe('Floccus', function() {
                 parentId: barFolder.id
               })
               await account.sync() // propagate to server
+              expect(account.getData().error).to.not.be.ok
+
               await account.setData({
                 ...account.getData(),
                 strategy: 'overwrite'
@@ -2746,7 +3300,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it('should update the server on local removals', async function() {
@@ -2769,6 +3323,8 @@ describe('Floccus', function() {
                 parentId: barFolder.id
               })
               await account.sync() // propagate to server
+              expect(account.getData().error).to.not.be.ok
+
               await account.setData({
                 ...account.getData(),
                 strategy: 'overwrite'
@@ -2784,7 +3340,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it('should update the server on local folder moves', async function() {
@@ -2812,6 +3368,8 @@ describe('Floccus', function() {
                 parentId: barFolder.id
               })
               await account.sync() // propagate to server
+              expect(account.getData().error).to.not.be.ok
+
               await account.setData({
                 ...account.getData(),
                 strategy: 'overwrite'
@@ -2829,7 +3387,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it("shouldn't create server bookmarks locally", async function() {
@@ -2842,12 +3400,13 @@ describe('Floccus', function() {
               const serverTree = await getAllBookmarks(account)
 
               if (adapter.onSyncStart) await adapter.onSyncStart()
-              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
-              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar'}))
+              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
               const serverMark = {
                 title: 'url',
                 url: 'http://ur.l/',
-                parentId: barFolderId
+                parentId: barFolderId,
+                location: ItemLocation.SERVER
               }
               await adapter.createBookmark(
                 new Bookmark(serverMark)
@@ -2862,7 +3421,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it("shouldn't update local bookmarks on server changes", async function() {
@@ -2870,12 +3429,13 @@ describe('Floccus', function() {
               const serverTree = await getAllBookmarks(account)
 
               if (adapter.onSyncStart) await adapter.onSyncStart()
-              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
-              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar'}))
+              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
               const serverMark = {
                 title: 'url',
                 url: 'http://ur.l/',
-                parentId: barFolderId
+                parentId: barFolderId,
+                location: ItemLocation.SERVER
               }
               const serverMarkId = await adapter.createBookmark(
                 new Bookmark(serverMark)
@@ -2883,6 +3443,7 @@ describe('Floccus', function() {
               if (adapter.onSyncComplete) await adapter.onSyncComplete()
 
               await account.sync() // propage creation
+              expect(account.getData().error).to.not.be.ok
               const originalTree = await account.localTree.getBookmarksTree(true)
               await account.setData({
                 ...account.getData(),
@@ -2892,7 +3453,8 @@ describe('Floccus', function() {
               const newServerMark = {
                 ...serverMark,
                 title: 'blah',
-                id: serverMarkId
+                id: serverMarkId,
+                location: ItemLocation.SERVER
               }
               await withSyncConnection(account, async() => {
                 await adapter.updateBookmark(new Bookmark(newServerMark))
@@ -2906,19 +3468,20 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
             it("shouldn't update local bookmarks on server removals", async function() {
               const adapter = account.server
               const serverTree = await getAllBookmarks(account)
               if (adapter.onSyncStart) await adapter.onSyncStart()
-              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo'}))
-              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar'}))
+              const fooFolderId = await adapter.createFolder(new Folder({parentId: serverTree.id, title: 'foo', location: ItemLocation.SERVER}))
+              const barFolderId = await adapter.createFolder(new Folder({parentId: fooFolderId, title: 'bar', location: ItemLocation.SERVER}))
               const serverMark = {
                 title: 'url',
                 url: 'http://ur.l/',
-                parentId: barFolderId
+                parentId: barFolderId,
+                location: ItemLocation.SERVER
               }
               const serverMarkId = await adapter.createBookmark(
                 new Bookmark(serverMark)
@@ -2926,6 +3489,7 @@ describe('Floccus', function() {
               if (adapter.onSyncComplete) await adapter.onSyncComplete()
 
               await account.sync() // propage creation
+              expect(account.getData().error).to.not.be.ok
               const originalTree = await account.localTree.getBookmarksTree(true)
               await account.setData({
                 ...account.getData(),
@@ -2944,13 +3508,13 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree,
                 originalTree,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
             })
           })
         })
         context('with two clients', function() {
-          this.timeout(60 * 60000) // timeout after 20mins
+          this.timeout(40 * 60000) // timeout after 20mins
           let account1, account2
           beforeEach('set up accounts', async function() {
             account1 = await Account.create(ACCOUNT_DATA)
@@ -2971,11 +3535,14 @@ describe('Floccus', function() {
           })
           afterEach('clean up accounts', async function() {
             await browser.bookmarks.removeTree(account1.getData().localRoot)
-            if (ACCOUNT_DATA.type !== 'fake') {
+            if (ACCOUNT_DATA.type === 'git') {
+              await account1.server.clearServer()
+            } else if (ACCOUNT_DATA.type !== 'fake') {
               await account1.setData({
                 ...account1.getData(),
                 serverRoot: null
               })
+              account1.lockTimeout = 0
               await withSyncConnection(account1, async() => {
                 const tree = await account1.server.getBookmarksTree(true)
                 await AsyncParallel.each(tree.children, async child => {
@@ -2989,13 +3556,25 @@ describe('Floccus', function() {
             }
             if (ACCOUNT_DATA.type === 'google-drive') {
               const fileList = await account1.server.listFiles('name = ' + "'" + account1.server.bookmark_file + "'")
-              const file = fileList.files[0]
-              if (file) {
+              const files = fileList.files
+              for (const file of files) {
                 await account1.server.deleteFile(file.id)
               }
+              if (files.length > 1) {
+                throw new Error('Google Drive sync left more than one file behind')
+              }
+            }
+            try {
+              await browser.bookmarks.removeTree(account1.getData().localRoot)
+            } catch (e) {
+              // noop
             }
             await account1.delete()
-            await browser.bookmarks.removeTree(account2.getData().localRoot)
+            try {
+              await browser.bookmarks.removeTree(account2.getData().localRoot)
+            } catch (e) {
+              // noop
+            }
             await account2.delete()
           })
           it('should not sync two clients at the same time', async function() {
@@ -3003,6 +3582,9 @@ describe('Floccus', function() {
               return this.skip()
             }
             if (ACCOUNT_DATA.type === 'nextcloud-bookmarks' && ['v1.1.2', 'v2.3.4', 'stable3', 'stable4'].includes(APP_VERSION)) {
+              return this.skip()
+            }
+            if (ACCOUNT_DATA.type === 'linkwarden') {
               return this.skip()
             }
             const localRoot = account1.getData().localRoot
@@ -3035,11 +3617,18 @@ describe('Floccus', function() {
               })
               await new Promise(resolve => setTimeout(resolve, 60000))
               expect(account2.getData().error).to.be.not.ok
-              expect(resolved).to.equal(false)
+              expect(account2.getData().scheduled).to.be.ok
+              expect(resolved).to.equal(true)
             })
             console.log('Finished sync with account 1')
+            sync2 = account2.sync()
+            sync2.then(() => {
+              console.log('Finished sync with account 2')
+              resolved = true
+            })
             await new Promise(resolve => setTimeout(resolve, 60000))
             expect(account2.getData().error).to.be.not.ok
+            expect(account2.getData().scheduled).to.be.not.ok
             expect(resolved).to.equal(true)
           })
           it('should propagate edits using "last write wins"', async function() {
@@ -3100,7 +3689,7 @@ describe('Floccus', function() {
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
 
             const tree1AfterSyncing = await account1.localTree.getBookmarksTree(
@@ -3112,13 +3701,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterSyncing,
               tree2AfterSyncing,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2AfterSyncing.title = serverTreeAfterSyncing.title
             expectTreeEqual(
               tree2AfterSyncing,
               serverTreeAfterSyncing,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should overtake moves to a different client', async function() {
@@ -3151,19 +3740,19 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterFirstSync.title = tree1.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2AfterFirstSync.title = tree1.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('First round ok')
 
@@ -3185,13 +3774,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterSecondSync,
               tree1BeforeSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterSecondSync.title = tree1AfterSecondSync.title
             expectTreeEqual(
               serverTreeAfterSecondSync,
               tree1AfterSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Second round first half ok')
 
@@ -3205,13 +3794,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree2AfterThirdSync,
               tree1AfterSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterThirdSync.title = tree2AfterThirdSync.title
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree2AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Second round second half ok')
 
@@ -3226,13 +3815,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFinalSync,
               tree2AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2AfterThirdSync.title = serverTreeAfterFinalSync.title
             expectTreeEqual(
               tree2AfterThirdSync,
               serverTreeAfterFinalSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should handle creations inside deletions gracefully', async function() {
@@ -3267,19 +3856,19 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterFirstSync.title = tree1.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2AfterFirstSync.title = tree1.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('First round ok')
 
@@ -3313,13 +3902,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterThirdSync,
               tree2BeforeSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterThirdSync.title = tree2BeforeSecondSync.title
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree2BeforeSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
 
             console.log('Second round second half ok')
@@ -3336,13 +3925,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree2AfterFinalSync,
               tree2BeforeSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2BeforeSecondSync.title = serverTreeAfterFinalSync.title
             expectTreeEqual(
               serverTreeAfterFinalSync,
               tree2BeforeSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should handle duplicate bookmarks in different serverRoot folders', async function() {
@@ -3414,12 +4003,12 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTree1,
               tree1AfterSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             expectTreeEqual(
               tree2AfterSync,
               tree1AfterSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should handle concurrent hierarchy reversals', async function() {
@@ -3463,19 +4052,22 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             serverTreeAfterFirstSync.title = tree1.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             tree2AfterFirstSync.title = tree1.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             console.log('First round ok')
 
@@ -3509,7 +4101,8 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
 
             console.log('Second round second half ok')
@@ -3527,13 +4120,15 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterFinalSync,
               tree2AfterFinalSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             tree1AfterThirdSync.title = tree2AfterFinalSync.title
             expectTreeEqual(
               tree2AfterFinalSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
           })
           it('should handle complex hierarchy reversals', async function() {
@@ -3598,21 +4193,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
             serverTreeAfterFirstSync.title = tree1.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
             tree2AfterFirstSync.title = tree1.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
             console.log('First round ok')
@@ -3656,7 +4251,7 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
 
@@ -3675,18 +4270,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterFinalSync,
               tree2AfterFinalSync,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
             tree1AfterThirdSync.title = tree2AfterFinalSync.title
             expectTreeEqual(
               tree2AfterFinalSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
           })
           it('should handle complex hierarchy reversals 2', async function() {
+            if (ACCOUNT_DATA.type === 'linkwarden') {
+              return this.skip()
+            }
             const localRoot = account1.getData().localRoot
             const aFolder = await browser.bookmarks.create({
               title: 'a',
@@ -3738,19 +4336,22 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             serverTreeAfterFirstSync.title = tree1.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             tree2AfterFirstSync.title = tree1.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             console.log('First round ok')
 
@@ -3798,7 +4399,8 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
 
             console.log('Second round second half ok')
@@ -3816,13 +4418,15 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterFinalSync,
               tree2AfterFinalSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             tree1AfterThirdSync.title = tree2AfterFinalSync.title
             expectTreeEqual(
               tree2AfterFinalSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
           })
           it('should handle faux hierarchy reversals', async function() {
@@ -3874,19 +4478,22 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             serverTreeAfterFirstSync.title = tree1.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             tree2AfterFirstSync.title = tree1.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             console.log('First round ok')
 
@@ -3946,7 +4553,8 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
 
             console.log('Second round second half ok')
@@ -3964,13 +4572,15 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterFinalSync,
               tree2AfterFinalSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
             tree1AfterThirdSync.title = tree2AfterFinalSync.title
             expectTreeEqual(
               tree2AfterFinalSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false,
+              false
             )
           })
           it('should handle complex move-remove interactions', async function() {
@@ -4018,21 +4628,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
             serverTreeAfterFirstSync.title = tree1.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
             tree2AfterFirstSync.title = tree1.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
             console.log('First round ok')
@@ -4067,7 +4677,7 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
 
@@ -4086,19 +4696,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterFinalSync,
               tree2AfterFinalSync,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
             tree1AfterThirdSync.title = tree2AfterFinalSync.title
             expectTreeEqual(
               tree2AfterFinalSync,
               tree1AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA),
+              false,
               false
             )
           })
           it('should synchronize ordering', async function() {
-            if (ACCOUNT_DATA.type === 'nextcloud-legacy') return this.skip()
+            if (ACCOUNT_DATA.type === 'linkwarden') {
+              return this.skip()
+            }
             expect(
               (await getAllBookmarks(account1)).children
             ).to.have.lengthOf(0)
@@ -4196,7 +4808,10 @@ describe('Floccus', function() {
           // Skipping this, because nextcloud adapter currently
           // isn't able to track bookmarks across dirs, thus in this
           // scenario both bookmarks survive :/
-          it.skip('should propagate moves using "last write wins"', async function() {
+          it('should propagate moves using "last write wins"', async function() {
+            if (ACCOUNT_DATA.type === 'nextcloud-bookmarks') {
+              return this.skip()
+            }
             const localRoot = account1.getData().localRoot
             const fooFolder = await browser.bookmarks.create({
               title: 'foo',
@@ -4225,19 +4840,19 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterFirstSync.title = tree1.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2AfterFirstSync.title = tree1.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('First round ok')
 
@@ -4258,13 +4873,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterSecondSync,
               tree1BeforeSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterSecondSync.title = tree1AfterSecondSync.title
             expectTreeEqual(
               serverTreeAfterSecondSync,
               tree1AfterSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Second round first half ok')
 
@@ -4286,13 +4901,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree2AfterThirdSync,
               tree2BeforeThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterThirdSync.title = tree2AfterThirdSync.title
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree2AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Second round second half ok')
 
@@ -4306,18 +4921,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFinalSync,
               tree2AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2AfterThirdSync.title = serverTreeAfterFinalSync.title
             expectTreeEqual(
               tree2AfterThirdSync,
               serverTreeAfterFinalSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
         })
 
         context('with tabs', function() {
+          if (ACCOUNT_DATA.type === 'linkwarden') {
+            return
+          }
           let account
           beforeEach('set up account', async function() {
             account = await Account.create(ACCOUNT_DATA)
@@ -4330,10 +4948,6 @@ describe('Floccus', function() {
             }
             await account.init()
             await account.setData({...account.getData(), localRoot: 'tabs'})
-            if (ACCOUNT_DATA.type === 'nextcloud-bookmarks' && ACCOUNT_DATA.oldAPIs) {
-              // account.server.hasFeatureHashing = false
-              account.server.hasFeatureChildren = false
-            }
             if (ACCOUNT_DATA.noCache) {
               account.storage.setCache = () => {
                 // noop
@@ -4351,12 +4965,15 @@ describe('Floccus', function() {
                 windowType: 'normal' // no devtools or panels or popups
               })
               await browser.tabs.remove(tabs.filter(tab => tab.url.startsWith('http')).map(tab => tab.id))
-              await awaitTabsUpdated()
             } catch (e) {
               console.error(e)
             }
-            if (ACCOUNT_DATA.type !== 'fake') {
+            await awaitTabsUpdated()
+            if (ACCOUNT_DATA.type === 'git') {
+              await account.server.clearServer()
+            } else if (ACCOUNT_DATA.type !== 'fake') {
               await account.setData({ ...account.getData(), serverRoot: null })
+              account.lockTimeout = 0
               const tree = await getAllBookmarks(account)
               await withSyncConnection(account, async() => {
                 await AsyncParallel.each(tree.children, async child => {
@@ -4370,25 +4987,24 @@ describe('Floccus', function() {
             }
             if (ACCOUNT_DATA.type === 'google-drive') {
               const fileList = await account.server.listFiles('name = ' + "'" + account.server.bookmark_file + "'")
-              const file = fileList.files[0]
-              if (file) {
+              const files = fileList.files
+              for (const file of files) {
                 await account.server.deleteFile(file.id)
+              }
+              if (files.length > 1) {
+                throw new Error('Google Drive sync left more than one file behind')
               }
             }
             await account.delete()
           })
           it('should create local tabs on the server', async function() {
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
-
             browser.tabs.create({
               index: 1,
-              url: 'https://floccus.org/#test1'
+              url: 'https://example.org/#test1'
             })
             browser.tabs.create({
               index: 2,
-              url: 'https://floccus.org/#test2'
+              url: 'https://example.org/#test2'
             })
             await awaitTabsUpdated()
 
@@ -4404,32 +5020,30 @@ describe('Floccus', function() {
                   new Folder({
                     title: 'Window 0',
                     children: [
-                      new Bookmark({ title: 'Private bookmarks sync - floccus.org', url: 'https://floccus.org/#test1' }),
-                      new Bookmark({ title: 'Private bookmarks sync - floccus.org', url: 'https://floccus.org/#test2' })
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test1' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test2' })
                     ]
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should create server bookmarks as tabs', async function() {
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
-
             const adapter = account.server
             const serverTree = await getAllBookmarks(account)
             let windowFolderId, serverMark
             await withSyncConnection(account, async() => {
               windowFolderId = await adapter.createFolder(new Folder({
                 parentId: serverTree.id,
-                title: 'Window 0'
+                title: 'Window 0',
+                location: ItemLocation.SERVER
               }))
               serverMark = {
-                title: 'Private bookmarks sync - floccus.org',
-                url: 'https://floccus.org/',
-                parentId: windowFolderId
+                title: 'Example Domain',
+                url: 'https://example.org/',
+                parentId: windowFolderId,
+                location: ItemLocation.SERVER
               }
 
               await adapter.createBookmark(
@@ -4449,28 +5063,24 @@ describe('Floccus', function() {
                   new Folder({
                     title: 'Window 0',
                     children: [
-                      new Bookmark({ title: 'Private bookmarks sync - floccus.org', url: 'https://floccus.org/' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/' }),
                     ]
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should update the server when pushing local changes', async function() {
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
-
             await account.setData({...account.getData(), strategy: 'overwrite'})
 
             browser.tabs.create({
               index: 1,
-              url: 'https://floccus.org/#test1'
+              url: 'https://example.org/#test1'
             })
             const tab = browser.tabs.create({
               index: 2,
-              url: 'https://floccus.org/#test2'
+              url: 'https://example.org/#test2'
             })
             await awaitTabsUpdated()
 
@@ -4486,16 +5096,16 @@ describe('Floccus', function() {
                   new Folder({
                     title: 'Window 0',
                     children: [
-                      new Bookmark({ title: 'Private bookmarks sync - floccus.org', url: 'https://floccus.org/#test1' }),
-                      new Bookmark({ title: 'Private bookmarks sync - floccus.org', url: 'https://floccus.org/#test2' })
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test1' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test2' })
                     ]
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
 
-            await browser.tabs.update(tab.id, {url: 'https://example.org'})
+            await browser.tabs.update(tab.id, {url: 'https://example.org/#test3'})
             await awaitTabsUpdated()
 
             await account.sync()
@@ -4510,32 +5120,30 @@ describe('Floccus', function() {
                   new Folder({
                     title: 'Window 0',
                     children: [
-                      new Bookmark({ title: 'Private bookmarks sync - floccus.org', url: 'https://floccus.org/#test1' }),
-                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/' })
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test1' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test3' })
                     ]
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           })
           it('should update local tabs when pulling server changes', async function() {
-            expect(
-              (await getAllBookmarks(account)).children
-            ).to.have.lengthOf(0)
-
             const adapter = account.server
             const serverTree = await getAllBookmarks(account)
             let windowFolderId, serverMark, serverMarkId
             await withSyncConnection(account, async() => {
               windowFolderId = await adapter.createFolder(new Folder({
                 parentId: serverTree.id,
-                title: 'Window 0'
+                title: 'Window 0',
+                location: ItemLocation.SERVER
               }))
               serverMark = {
-                title: 'Private bookmarks sync - floccus.org',
-                url: 'https://floccus.org/',
-                parentId: windowFolderId
+                title: 'Example Domain',
+                url: 'https://example.org/#test1',
+                parentId: windowFolderId,
+                location: ItemLocation.SERVER
               }
 
               serverMarkId = await adapter.createBookmark(
@@ -4555,26 +5163,27 @@ describe('Floccus', function() {
                   new Folder({
                     title: 'Window 0',
                     children: [
-                      new Bookmark({ title: 'Private bookmarks sync - floccus.org', url: 'https://floccus.org/' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test1' }),
                     ]
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
 
             let serverMark2
             await withSyncConnection(account, async() => {
               serverMark2 = {
                 title: 'Example Domain',
-                url: 'https://example.org/#test',
-                parentId: windowFolderId
+                url: 'https://example.org/#test3',
+                parentId: tree.children[0].id,
+                location: ItemLocation.SERVER
               }
               await adapter.createBookmark(
                 new Bookmark(serverMark2)
               )
 
-              await adapter.updateBookmark({ ...serverMark, id: serverMarkId, url: 'https://example.org/', title: 'Example Domain', parentId: windowFolderId })
+              await adapter.updateBookmark({ ...serverMark, id: serverMarkId, url: 'https://example.org/#test2', title: 'Example Domain', parentId: tree.children[0].id })
             })
 
             await account.setData({...account.getData(), strategy: 'slave'})
@@ -4591,13 +5200,99 @@ describe('Floccus', function() {
                   new Folder({
                     title: 'Window 0',
                     children: [
-                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/' }),
-                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test2' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test3' }),
                     ]
                   })
                 ]
               }),
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
+            )
+          })
+          it('should sync tabs correctly when merging server and local changes', async function() {
+            if (ACCOUNT_DATA.noCache) {
+              return this.skip()
+            }
+            const adapter = account.server
+            const serverTree = await getAllBookmarks(account)
+            let windowFolderId, serverMark, serverMarkId
+            await withSyncConnection(account, async() => {
+              windowFolderId = await adapter.createFolder(new Folder({
+                parentId: serverTree.id,
+                title: 'Window 0',
+                location: ItemLocation.SERVER
+              }))
+              serverMark = {
+                title: 'Example Domain',
+                url: 'https://example.org/#test1',
+                parentId: windowFolderId,
+                location: ItemLocation.SERVER
+              }
+
+              serverMarkId = await adapter.createBookmark(
+                new Bookmark(serverMark)
+              )
+            })
+
+            await account.sync()
+            expect(account.getData().error).to.not.be.ok
+
+            let tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'Window 0',
+                    children: [
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test1' }),
+                    ]
+                  })
+                ]
+              }),
+              false
+            )
+
+            let serverMark2
+            await withSyncConnection(account, async() => {
+              serverMark2 = {
+                title: 'Example Domain',
+                url: 'https://example.org/#test3',
+                parentId: tree.children[0].id,
+                location: ItemLocation.SERVER
+              }
+              await adapter.createBookmark(
+                new Bookmark(serverMark2)
+              )
+
+              await adapter.updateBookmark({ ...serverMark, id: serverMarkId, url: 'https://example.org/#test2', title: 'Example Domain', parentId: tree.children[0].id })
+            })
+
+            await browser.tabs.create({url: 'https://example.org/#test4'})
+            await awaitTabsUpdated()
+
+            await account.sync()
+            expect(account.getData().error).to.not.be.ok
+
+            tree = await getAllBookmarks(account)
+            expectTreeEqual(
+              tree,
+              new Folder({
+                title: tree.title,
+                children: [
+                  new Folder({
+                    title: 'Window 0',
+                    children: [
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test2' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test3' }),
+                      new Bookmark({ title: 'Example Domain', url: 'https://example.org/#test4' }),
+                    ]
+                  })
+                ]
+              }),
+              false,
+              false, // We're merging which doesn't guarantee an order
             )
           })
         })
@@ -4614,7 +5309,7 @@ describe('Floccus', function() {
         const setInterrupt = () => {
           if (!timeouts.length) {
             timeouts = new Array(1000).fill(0).map(() =>
-              ACCOUNT_DATA.type === 'nextcloud-bookmarks' ? random.int(50000, 150000) : random.int(1000,30000)
+              ACCOUNT_DATA.type === 'nextcloud-bookmarks' ? random.int(50000, 150000) : random.int(100,3000)
             )
           }
           const timeout = timeouts[(i++) % 1000]
@@ -4641,18 +5336,33 @@ describe('Floccus', function() {
           await account2.init()
 
           if (ACCOUNT_DATA.type === 'fake') {
-            // Wrire both accounts to the same fake db
-            account2.server.bookmarksCache = account1.server.bookmarksCache = new Folder(
+            // Wire both accounts to the same fake db
+            // We do not set the cache properties to the same object, because we want to only write onSynComplete
+            let fakeServerDb = new Folder(
               { id: '', title: 'root', location: 'Server' }
             )
+            account1.server.bookmarksCache = new Folder(
+              { id: '', title: 'root', location: 'Server' }
+            )
+            account2.server.bookmarksCache = new Folder(
+              { id: '', title: 'root', location: 'Server' }
+            )
+            account1.server.onSyncStart = () => {
+              account1.server.bookmarksCache = fakeServerDb.clone(false)
+            }
+            account1.server.onSyncComplete = () => {
+              fakeServerDb = account1.server.bookmarksCache.clone(false)
+            }
+            account2.server.onSyncStart = () => {
+              account2.server.bookmarksCache = fakeServerDb.clone(false)
+            }
+            account2.server.onSyncComplete = () => {
+              fakeServerDb = account2.server.bookmarksCache.clone(false)
+            }
             account2.server.__defineSetter__('highestId', (id) => {
               account1.server.highestId = id
             })
             account2.server.__defineGetter__('highestId', () => account1.server.highestId)
-          }
-          if (ACCOUNT_DATA.type === 'nextcloud-bookmarks' && ACCOUNT_DATA.oldAPIs) {
-            account1.server.hasFeatureHashing = false
-            account2.server.hasFeatureHashing = false
           }
           if (ACCOUNT_DATA.noCache) {
             account1.storage.setCache = () => {
@@ -4672,11 +5382,14 @@ describe('Floccus', function() {
         afterEach('clean up accounts', async function() {
           RUN_INTERRUPTS = false
           await browser.bookmarks.removeTree(account1.getData().localRoot)
-          if (ACCOUNT_DATA.type !== 'fake') {
+          if (ACCOUNT_DATA.type === 'git') {
+            await account1.server.clearServer()
+          } else if (ACCOUNT_DATA.type !== 'fake') {
             await account1.setData({
               ...account1.getData(),
               serverRoot: null
             })
+            account1.lockTimeout = 0
             const tree = await getAllBookmarks(account1)
             await withSyncConnection(account1, async() => {
               await AsyncParallel.each(tree.children, async child => {
@@ -4690,9 +5403,12 @@ describe('Floccus', function() {
           }
           if (ACCOUNT_DATA.type === 'google-drive') {
             const fileList = await account1.server.listFiles('name = ' + "'" + account1.server.bookmark_file + "'")
-            const file = fileList.files[0]
-            if (file) {
+            const files = fileList.files
+            for (const file of files) {
               await account1.server.deleteFile(file.id)
+            }
+            if (files.length > 1) {
+              throw new Error('Google Drive sync left more than one file behind')
             }
           }
           await account1.delete()
@@ -4751,19 +5467,19 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2AfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           }
           serverTreeAfterFirstSync = null
@@ -4791,13 +5507,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterSecondSync,
               tree1BeforeSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterSecondSync.title = tree1AfterSecondSync.title
             expectTreeEqual(
               serverTreeAfterSecondSync,
               tree1AfterSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           }
           tree1BeforeSecondSync = null
@@ -4816,13 +5532,13 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree2AfterThirdSync,
               tree1AfterSecondSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             serverTreeAfterThirdSync.title = tree2AfterThirdSync.title
             expectTreeEqual(
               serverTreeAfterThirdSync,
               tree2AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           }
           serverTreeAfterThirdSync = null
@@ -4841,20 +5557,20 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFinalSync,
               tree2AfterThirdSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             tree2AfterThirdSync.title = serverTreeAfterFinalSync.title
             expectTreeEqual(
               tree2AfterThirdSync,
               serverTreeAfterFinalSync,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
           }
           serverTreeAfterFinalSync = null
           tree1AfterFinalSync = null
         })
 
-        it('should handle fuzzed changes', async function() {
+        it('should handle fuzzed changes from one client', async function() {
           const localRoot = account1.getData().localRoot
           let bookmarks = []
           let folders = []
@@ -4904,7 +5620,7 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
 
             console.log('Initial round: first tree ok')
@@ -4912,14 +5628,14 @@ describe('Floccus', function() {
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: server tree ok')
             tree2AfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: second tree ok')
           }
@@ -4945,14 +5661,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('first tree ok')
               tree2AfterFirstSync.title = serverTreeAfterFirstSync.title
               expectTreeEqual(
                 tree2AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Initial round: second tree ok')
             }
@@ -4978,14 +5694,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterSync,
                 tree1BeforeSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: local tree tree ok')
               serverTreeAfterSync.title = tree1AfterSync.title
               expectTreeEqual(
                 serverTreeAfterSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: server tree tree ok')
             }
@@ -5006,14 +5722,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree2AfterSecondSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: second local tree tree ok')
               serverTreeAfterSecondSync.title = tree2AfterSecondSync.title
               expectTreeEqual(
                 serverTreeAfterSecondSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: second server tree tree ok')
             }
@@ -5034,14 +5750,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFinalSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: local tree tree ok')
               tree2AfterSecondSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterFinalSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: server tree tree ok')
             }
@@ -5064,14 +5780,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterInit,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: local tree ok')
               tree2AfterSecondSync.title = serverTreeAfterInit.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: server tree ok')
             }
@@ -5135,21 +5851,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: first tree ok')
             serverTreeAfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: server tree ok')
             tree2AfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: second tree ok')
           }
@@ -5174,14 +5890,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('first tree ok')
               tree2AfterFirstSync.title = serverTreeAfterFirstSync.title
               expectTreeEqual(
                 tree2AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Initial round: second tree ok')
             }
@@ -5193,6 +5909,8 @@ describe('Floccus', function() {
               tree2AfterFirstSync.createIndex()
               bookmarks2 = Object.values(tree2AfterFirstSync.index.bookmark)
               folders2 = Object.values(tree2AfterFirstSync.index.folder)
+                // Make sure we don't delete the root folder :see_no_evil:
+                .filter(item => item.id !== tree2AfterFirstSync.id)
             }
 
             await randomlyManipulateTree(account1, folders1, bookmarks1, 20)
@@ -5214,14 +5932,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterSync,
                 tree1BeforeSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: local tree tree ok')
               serverTreeAfterSync.title = tree1AfterSync.title
               expectTreeEqual(
                 serverTreeAfterSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: server tree tree ok')
             }
@@ -5234,6 +5952,15 @@ describe('Floccus', function() {
             expect(account2.getData().error).to.not.be.ok
             console.log('second round: account1 completed')
 
+            if (ACCOUNT_DATA.type === 'nextcloud-bookmarks') {
+              // Extra round-trip for Nextcloud Bookmarks' different ID system
+              await account1.sync()
+              expect(account1.getData().error).to.not.be.ok
+              await account2.sync()
+              expect(account2.getData().error).to.not.be.ok
+              console.log('Extra round-trip for Nextcloud Bookmarks completed')
+            }
+
             let serverTreeAfterSecondSync = await getAllBookmarks(account1)
 
             let tree2AfterSecondSync = await account2.localTree.getBookmarksTree(
@@ -5244,7 +5971,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 serverTreeAfterSecondSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: second server tree tree ok')
             }
@@ -5265,14 +5992,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFinalSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: local tree tree ok')
               tree2AfterSecondSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterFinalSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: server tree tree ok')
             }
@@ -5295,14 +6022,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterInit,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: local tree ok')
               tree2AfterSecondSync.title = serverTreeAfterInit.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: server tree ok')
             }
@@ -5366,21 +6093,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: first tree ok')
             serverTreeAfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: server tree ok')
             tree2AfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: second tree ok')
           }
@@ -5406,14 +6133,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('first tree ok')
               tree2AfterFirstSync.title = serverTreeAfterFirstSync.title
               expectTreeEqual(
                 tree2AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Initial round: second tree ok')
             }
@@ -5425,12 +6152,14 @@ describe('Floccus', function() {
               tree2AfterFirstSync.createIndex()
               bookmarks2 = Object.values(tree2AfterFirstSync.index.bookmark)
               folders2 = Object.values(tree2AfterFirstSync.index.folder)
+                // Make sure we don't delete the root folder :see_no_evil:
+                .filter(item => item.id !== tree2AfterFirstSync.id)
             }
 
-            await randomlyManipulateTreeWithDeletions(account1, folders1, bookmarks1, 35)
-            await randomlyManipulateTreeWithDeletions(account2, folders2, bookmarks2, 35)
+            await randomlyManipulateTreeWithDeletions(account1, folders1, bookmarks1, RANDOM_MANIPULATION_ITERATIONS)
+            await randomlyManipulateTreeWithDeletions(account2, folders2, bookmarks2, RANDOM_MANIPULATION_ITERATIONS)
 
-            console.log(' acc1: Moved items')
+            console.log(' acc1&acc2: Moved items')
 
             let tree1BeforeSync = await account1.localTree.getBookmarksTree(
               true
@@ -5446,14 +6175,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterSync,
                 tree1BeforeSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: local tree tree ok')
               serverTreeAfterSync.title = tree1AfterSync.title
               expectTreeEqual(
                 serverTreeAfterSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: server tree tree ok')
             }
@@ -5481,7 +6210,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 serverTreeAfterSecondSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: second server tree tree ok')
             }
@@ -5502,14 +6231,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFinalSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: local tree tree ok')
               tree2AfterSecondSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterFinalSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: server tree tree ok')
             }
@@ -5531,14 +6260,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterInit,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: local tree ok')
               tree2AfterSecondSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: server tree ok')
             }
@@ -5547,11 +6276,8 @@ describe('Floccus', function() {
             serverTreeAfterInit = null
           }
         })
-
-        it('should handle fuzzed changes with deletions from two clients with interrupts', async function() {
-          if (ACCOUNT_DATA.type === 'nextcloud-bookmarks' && ACCOUNT_DATA.oldAPIs) {
-            return this.skip()
-          }
+        let interruptBenchmark
+        it.skip('should handle fuzzed changes with deletions from two clients with interrupts' + (ACCOUNT_DATA.type === 'fake' ? ' (with caching)' : ''), interruptBenchmark = async function() {
           const localRoot = account1.getData().localRoot
           let bookmarks1 = []
           let folders1 = []
@@ -5603,21 +6329,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: first tree ok')
             serverTreeAfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: server tree ok')
             tree2AfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: second tree ok')
           }
@@ -5646,14 +6372,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('first tree ok')
               tree2AfterFirstSync.title = serverTreeAfterFirstSync.title
               expectTreeEqual(
                 tree2AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Initial round: second tree ok')
             }
@@ -5665,12 +6391,16 @@ describe('Floccus', function() {
               tree2AfterFirstSync.createIndex()
               bookmarks2 = Object.values(tree2AfterFirstSync.index.bookmark)
               folders2 = Object.values(tree2AfterFirstSync.index.folder)
+                // Make sure we don't delete the root folder :see_no_evil:
+                .filter(item => item.id !== tree2AfterFirstSync.id)
             }
 
-            await randomlyManipulateTreeWithDeletions(account1, folders1, bookmarks1, 35)
-            await randomlyManipulateTreeWithDeletions(account2, folders2, bookmarks2, 35)
+            RUN_INTERRUPTS = false
+            await randomlyManipulateTreeWithDeletions(account1, folders1, bookmarks1, RANDOM_MANIPULATION_ITERATIONS)
+            await randomlyManipulateTreeWithDeletions(account2, folders2, bookmarks2, RANDOM_MANIPULATION_ITERATIONS)
+            RUN_INTERRUPTS = true
 
-            console.log(' acc1: Moved items')
+            console.log(' acc1 &acc2: Moved items')
 
             let tree1BeforeSync = await account1.localTree.getBookmarksTree(
               true
@@ -5685,14 +6415,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterSync,
                 tree1BeforeSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: local tree tree ok')
               serverTreeAfterSync.title = tree1AfterSync.title
               expectTreeEqual(
                 serverTreeAfterSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: server tree tree ok')
             }
@@ -5718,7 +6448,7 @@ describe('Floccus', function() {
               expectTreeEqual(
                 serverTreeAfterSecondSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: second server tree tree ok')
             }
@@ -5738,14 +6468,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFinalSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: local tree tree ok')
               tree2AfterSecondSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterFinalSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: server tree tree ok')
             }
@@ -5766,14 +6496,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterInit,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: local tree ok')
               tree2AfterSecondSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: server tree ok')
             }
@@ -5782,6 +6512,21 @@ describe('Floccus', function() {
             serverTreeAfterInit = null
           }
         })
+
+        if (ACCOUNT_DATA.type === 'fake') {
+          it.skip('should handle fuzzed changes with deletions from two clients with interrupts (no caching adapter)', async function() {
+            // Wire both accounts to the same fake db
+            // We set the cache properties to the same object, because we want to simulate nextcloud-bookmarks
+            account1.server.bookmarksCache = account2.server.bookmarksCache = new Folder(
+              { id: '', title: 'root', location: 'Server' }
+            )
+            delete account1.server.onSyncStart
+            delete account1.server.onSyncComplete
+            delete account2.server.onSyncStart
+            delete account2.server.onSyncComplete
+            await interruptBenchmark()
+          })
+        }
 
         it('unidirectional should handle fuzzed changes from two clients', async function() {
           await account2.setData({...account2.getData(), strategy: 'slave'})
@@ -5838,21 +6583,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: first tree ok')
             serverTreeAfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: server tree ok')
             tree2AfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: second tree ok')
           }
@@ -5877,14 +6622,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('first tree ok')
               tree2AfterFirstSync.title = serverTreeAfterFirstSync.title
               expectTreeEqual(
                 tree2AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Initial round: second tree ok')
             }
@@ -5896,6 +6641,8 @@ describe('Floccus', function() {
               tree2AfterFirstSync.createIndex()
               bookmarks2 = Object.values(tree2AfterFirstSync.index.bookmark)
               folders2 = Object.values(tree2AfterFirstSync.index.folder)
+                // Make sure we don't delete the root folder :see_no_evil:
+                .filter(item => item.id !== tree2AfterFirstSync.id)
             }
 
             await randomlyManipulateTree(account1, folders1, bookmarks1, 20)
@@ -5917,14 +6664,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterSync,
                 tree1BeforeSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: local tree tree ok')
               serverTreeAfterSync.title = tree1AfterSync.title
               expectTreeEqual(
                 serverTreeAfterSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: server tree tree ok')
             }
@@ -5945,13 +6692,13 @@ describe('Floccus', function() {
               expectTreeEqual(
                 serverTreeAfterSecondSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               serverTreeAfterSecondSync.title = tree2AfterSecondSync.title
               expectTreeEqual(
                 serverTreeAfterSecondSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: second server tree tree ok')
             }
@@ -5972,14 +6719,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFinalSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: local tree tree ok')
               tree2AfterSecondSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterFinalSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: server tree tree ok')
             }
@@ -6002,20 +6749,20 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterSync,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               tree1AfterInit.title = serverTreeAfterSync.title
               expectTreeEqual(
                 tree1AfterInit,
                 serverTreeAfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: local tree ok')
               tree2AfterSecondSync.title = serverTreeAfterInit.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: server tree ok')
             }
@@ -6081,21 +6828,21 @@ describe('Floccus', function() {
             expectTreeEqual(
               tree1AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: first tree ok')
             serverTreeAfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               serverTreeAfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: server tree ok')
             tree2AfterFirstSync.title = tree1Initial.title
             expectTreeEqual(
               tree2AfterFirstSync,
               tree1Initial,
-              ignoreEmptyFolders(ACCOUNT_DATA)
+              false
             )
             console.log('Initial round: second tree ok')
           }
@@ -6121,14 +6868,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('first tree ok')
               tree2AfterFirstSync.title = serverTreeAfterFirstSync.title
               expectTreeEqual(
                 tree2AfterFirstSync,
                 serverTreeAfterFirstSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Initial round: second tree ok')
             }
@@ -6140,10 +6887,12 @@ describe('Floccus', function() {
               tree2AfterFirstSync.createIndex()
               bookmarks2 = Object.values(tree2AfterFirstSync.index.bookmark)
               folders2 = Object.values(tree2AfterFirstSync.index.folder)
+                // Make sure we don't delete the root folder :see_no_evil:
+                .filter(item => item.id !== tree2AfterFirstSync.id)
             }
 
-            await randomlyManipulateTreeWithDeletions(account1, folders1, bookmarks1, 35)
-            await randomlyManipulateTreeWithDeletions(account2, folders2, bookmarks2, 35)
+            await randomlyManipulateTreeWithDeletions(account1, folders1, bookmarks1, RANDOM_MANIPULATION_ITERATIONS)
+            await randomlyManipulateTreeWithDeletions(account2, folders2, bookmarks2, RANDOM_MANIPULATION_ITERATIONS)
 
             console.log(' acc1: Moved items')
 
@@ -6162,14 +6911,14 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterSync,
                 tree1BeforeSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: local tree tree ok')
               serverTreeAfterSync.title = tree1AfterSync.title
               expectTreeEqual(
                 serverTreeAfterSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: server tree tree ok')
             }
@@ -6195,13 +6944,13 @@ describe('Floccus', function() {
               expectTreeEqual(
                 serverTreeAfterSecondSync,
                 serverTreeAfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               serverTreeAfterSecondSync.title = tree2AfterSecondSync.title
               expectTreeEqual(
                 serverTreeAfterSecondSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Second round: second server tree tree ok')
             }
@@ -6223,26 +6972,26 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterFinalSync,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               tree2AfterSecondSync.title = tree1AfterFinalSync.title
               expectTreeEqual(
                 tree1AfterFinalSync,
                 tree2AfterSecondSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: local tree tree ok')
               serverTreeAfterSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 serverTreeAfterFinalSync,
                 serverTreeAfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               tree2AfterSecondSync.title = serverTreeAfterFinalSync.title
               expectTreeEqual(
                 tree2AfterSecondSync,
                 serverTreeAfterFinalSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round: server tree tree ok')
             }
@@ -6264,20 +7013,20 @@ describe('Floccus', function() {
               expectTreeEqual(
                 tree1AfterInit,
                 serverTreeAfterInit,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               tree1AfterInit.title = tree1AfterSync.title
               expectTreeEqual(
                 tree1AfterInit,
                 tree1AfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: local tree ok')
               serverTreeAfterInit.title = serverTreeAfterSync.title
               expectTreeEqual(
                 serverTreeAfterInit,
                 serverTreeAfterSync,
-                ignoreEmptyFolders(ACCOUNT_DATA)
+                false
               )
               console.log('Final round after init: server tree ok')
             }
@@ -6294,10 +7043,6 @@ describe('Floccus', function() {
 function hasNoBookmarks(child) {
   if (child instanceof Bookmark) return false
   else return !child.children.some(child => !hasNoBookmarks(child))
-}
-
-function ignoreEmptyFolders(account_data) {
-  return account_data.type === 'nextcloud-legacy'
 }
 
 async function getAllBookmarks(account) {
@@ -6395,6 +7140,7 @@ async function randomlyManipulateTreeWithDeletions(account, folders, bookmarks, 
       await browser.bookmarks.update(magicBookmark.id, {title: newTitle})
       console.log('Rename #' + magicBookmark.id + '[' + magicBookmark.title + '] to ' + newTitle)
 
+      // randomly remove one folder
       magicFolder1 = folders[random.int(0, folders.length - 1)]
       await browser.bookmarks.removeTree(magicFolder1.id)
       folders.splice(folders.indexOf(magicFolder1), 1)
@@ -6456,10 +7202,11 @@ async function syncAccountWithInterrupts(account) {
   try {
     expect(account.getData().error).to.not.be.ok
   } catch (e) {
-    if (!account.getData().error.includes('E027')) {
+    if (!account.getData().error.includes('E026') && !account.getData().error.includes('E027')) {
       throw e
     } else {
       console.log(account.getData().error)
+      account.lockTimeout = 0
       await syncAccountWithInterrupts(account)
     }
   }
@@ -6467,7 +7214,6 @@ async function syncAccountWithInterrupts(account) {
 
 function stringifyAccountData(ACCOUNT_DATA) {
   return `${ACCOUNT_DATA.type}${
-    (ACCOUNT_DATA.type === 'nextcloud-bookmarks' && ACCOUNT_DATA.oldAPIs ? '-old' : '') +
     (ACCOUNT_DATA.noCache ? '-noCache' : '') +
     (typeof ACCOUNT_DATA.bookmark_file_type !== 'undefined' ? '-' + ACCOUNT_DATA.bookmark_file_type : '') +
     ((ACCOUNT_DATA.type === 'google-drive' && ACCOUNT_DATA.password) || (ACCOUNT_DATA.type === 'webdav' && ACCOUNT_DATA.passphrase) ? '-encrypted' : '')

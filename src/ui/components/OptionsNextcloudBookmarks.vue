@@ -1,5 +1,15 @@
 <template>
   <v-container>
+    <div>
+      <v-text-field
+        append-icon="mdi-label"
+        class="mt-2 mb-4"
+        :value="label"
+        :label="t('LabelAccountlabel')"
+        :hint="t('DescriptionAccountlabel')"
+        :persistent-hint="true"
+        @input="$emit('update:label', $event)" />
+    </div>
     <v-card class="mb-4">
       <v-card-title
         id="server">
@@ -60,6 +70,7 @@
         <OptionAllowNetwork
           :value="allowNetwork"
           @input="$emit('update:allowNetwork', $event)" />
+        <OptionExportBookmarks />
       </v-card-text>
     </v-card>
 
@@ -71,18 +82,32 @@
         {{ t('LabelOptionsSyncBehavior') }}
       </v-card-title>
       <v-card-text>
+        <v-switch
+          :input-value="enabled"
+          :aria-label="t('LabelAutosync')"
+          :label="t('LabelAutosync')"
+          dense
+          class="mt-0 pt-0"
+          @change="$emit('update:enabled', $event)" />
         <OptionSyncInterval
-          v-if="isBrowser"
           :value="syncInterval"
           @input="$emit('update:syncInterval', $event)" />
         <OptionSyncStrategy
-          v-if="!isBrowser"
           :value="strategy"
           @input="$emit('update:strategy', $event)" />
         <OptionNestedSync
           v-if="isBrowser"
           :value="nestedSync"
           @input="$emit('update:nestedSync', $event)" />
+        <v-switch
+          :input-value="clickCountEnabled"
+          :aria-label="t('LabelClickcount')"
+          :label="t('LabelClickcount')"
+          :hint="t('DescriptionClickcount')"
+          :persistent-hint="true"
+          dense
+          class="mt-0 pt-0"
+          @change="$emit('update:clickCountEnabled', $event); requestHistoryPermissions()" />
       </v-card-text>
     </v-card>
 
@@ -126,11 +151,13 @@ import OptionClientCert from './OptionClientCert'
 import OptionAllowRedirects from './OptionAllowRedirects'
 import OptionDownloadLogs from './OptionDownloadLogs'
 import OptionAllowNetwork from './native/OptionAllowNetwork'
+import OptionExportBookmarks from './OptionExportBookmarks.vue'
+import { actions } from '../store/definitions'
 
 export default {
   name: 'OptionsNextcloudBookmarks',
-  components: { OptionAllowNetwork, OptionDownloadLogs, OptionAllowRedirects, OptionClientCert, OptionFailsafe, OptionNestedSync, NextcloudLogin, OptionSyncFolder, OptionDeleteAccount, OptionSyncStrategy, OptionResetCache, OptionSyncInterval },
-  props: ['url', 'username', 'password', 'includeCredentials', 'serverRoot', 'localRoot', 'allowNetwork', 'syncInterval', 'strategy', 'nestedSync', 'failsafe', 'allowRedirects'],
+  components: { OptionExportBookmarks, OptionAllowNetwork, OptionDownloadLogs, OptionAllowRedirects, OptionClientCert, OptionFailsafe, OptionNestedSync, NextcloudLogin, OptionSyncFolder, OptionDeleteAccount, OptionSyncStrategy, OptionResetCache, OptionSyncInterval },
+  props: ['url', 'username', 'password', 'includeCredentials', 'serverRoot', 'localRoot', 'allowNetwork', 'syncInterval', 'strategy', 'nestedSync', 'failsafe', 'allowRedirects', 'enabled', 'label', 'clickCountEnabled'],
   data() {
     return {
       panels: [0, 1]
@@ -148,6 +175,9 @@ export default {
     validateServerRoot(path) {
       return !path || path === '/' || (path[0] === '/' && path[path.length - 1] !== '/')
     },
+    requestHistoryPermissions() {
+      this.$store.dispatch(actions.REQUEST_HISTORY_PERMISSIONS)
+    }
   }
 }
 </script>

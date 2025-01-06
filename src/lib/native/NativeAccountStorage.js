@@ -1,8 +1,8 @@
-import { Storage } from '@capacitor/storage'
+import { Preferences as Storage } from '@capacitor/preferences'
 import Cryptography from '../Crypto'
 import DefunctCryptography from '../DefunctCrypto'
 import Mappings from '../Mappings'
-import { Folder } from '../Tree'
+import { Folder, ItemLocation } from '../Tree'
 import AsyncLock from 'async-lock'
 
 const storageLock = new AsyncLock()
@@ -101,7 +101,7 @@ export default class NativeAccountStorage {
     const data = await NativeAccountStorage.getEntry(
       `bookmarks[${this.accountId}].cache`
     )
-    return Folder.hydrate(data && Object.keys(data).length ? data : {})
+    return Folder.hydrate(data && Object.keys(data).length ? data : {location: ItemLocation.LOCAL})
   }
 
   async setCache(data) {
@@ -152,5 +152,13 @@ export default class NativeAccountStorage {
 
   async deleteMappings() {
     await NativeAccountStorage.deleteEntry(`bookmarks[${this.accountId}].mappings`)
+  }
+
+  async getCurrentContinuation() {
+    return NativeAccountStorage.getEntry(`bookmarks[${this.accountId}].continuation`)
+  }
+
+  async setCurrentContinuation(continuation) {
+    await NativeAccountStorage.changeEntry(`bookmarks[${this.accountId}].continuation`, (_) => continuation, null)
   }
 }
