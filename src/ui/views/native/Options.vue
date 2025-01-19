@@ -27,6 +27,11 @@
           v-bind.sync="data"
           @reset="onReset"
           @delete="onDelete" />
+        <OptionsLinkwarden
+          v-if="data.type === 'linkwarden'"
+          v-bind.sync="data"
+          @reset="onReset"
+          @delete="onDelete" />
         <OptionsWebdav
           v-if="data.type === 'webdav'"
           v-bind.sync="data"
@@ -42,6 +47,11 @@
           v-bind.sync="data"
           @reset="onReset"
           @delete="onDelete" />
+        <OptionsGit
+          v-if="data.type === 'git'"
+          v-bind.sync="data"
+          @reset="onReset"
+          @delete="onDelete" />
       </v-form>
     </v-main>
   </div>
@@ -51,14 +61,15 @@
 import OptionsFake from '../../components/OptionsFake'
 import OptionsWebdav from '../../components/OptionsWebdav'
 import OptionsNextcloudBookmarks from '../../components/OptionsNextcloudBookmarks'
-import { actions } from '../../store/native'
+import { actions } from '../../store/definitions'
 import { routes } from '../../NativeRouter'
 import OptionsGoogleDrive from '../../components/OptionsGoogleDrive'
-// iport PathHelper from '../../../lib/PathHelper'
+import OptionsGit from '../../components/OptionsGit.vue'
+import OptionsLinkwarden from '../../components/OptionsLinkwarden.vue'
 
 export default {
   name: 'Options',
-  components: { OptionsGoogleDrive, OptionsNextcloudBookmarks, OptionsWebdav, OptionsFake },
+  components: { OptionsLinkwarden, OptionsGit, OptionsGoogleDrive, OptionsNextcloudBookmarks, OptionsWebdav, OptionsFake },
   data() {
     return {
       drawer: false,

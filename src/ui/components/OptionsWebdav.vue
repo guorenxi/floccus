@@ -1,5 +1,15 @@
 <template>
   <v-container>
+    <div>
+      <v-text-field
+        append-icon="mdi-label"
+        class="mt-2 mb-4"
+        :value="label"
+        :label="t('LabelAccountlabel')"
+        :hint="t('DescriptionAccountlabel')"
+        :persistent-hint="true"
+        @input="$emit('update:label', $event)" />
+    </div>
     <v-card class="mb-4">
       <v-card-text
         id="server"
@@ -69,6 +79,7 @@
         <OptionAllowNetwork
           :value="allowNetwork"
           @input="$emit('update:allowNetwork', $event)" />
+        <OptionExportBookmarks />
       </v-card-text>
     </v-card>
 
@@ -80,12 +91,13 @@
         {{ t('LabelOptionsSyncBehavior') }}
       </v-card-title>
       <v-card-text>
+        <OptionAutoSync
+          :value="enabled"
+          @input="$emit('update:enabled', $event)" />
         <OptionSyncInterval
-          v-if="isBrowser"
           :value="syncInterval"
           @input="$emit('update:syncInterval', $event)" />
         <OptionSyncStrategy
-          v-if="!isBrowser"
           :value="strategy"
           @input="$emit('update:strategy', $event)" />
         <OptionNestedSync
@@ -134,11 +146,15 @@ import OptionClientCert from './OptionClientCert'
 import OptionAllowRedirects from './OptionAllowRedirects'
 import OptionDownloadLogs from './OptionDownloadLogs'
 import OptionAllowNetwork from './native/OptionAllowNetwork'
+import OptionFileType from './OptionFileType'
+import OptionExportBookmarks from './OptionExportBookmarks.vue'
+import OptionPassphrase from './OptionPassphrase.vue'
+import OptionAutoSync from './OptionAutoSync.vue'
 
 export default {
   name: 'OptionsWebdav',
-  components: { OptionAllowNetwork, OptionDownloadLogs, OptionAllowRedirects, OptionClientCert, OptionFailsafe, OptionSyncFolder, OptionDeleteAccount, OptionSyncStrategy, OptionResetCache, OptionSyncInterval, OptionNestedSync },
-  props: ['url', 'username', 'password','passphrase', 'includeCredentials', 'serverRoot', 'localRoot', 'allowNetwork', 'syncInterval', 'strategy', 'bookmark_file', 'nestedSync', 'failsafe', 'allowRedirects'],
+  components: { OptionAutoSync, OptionExportBookmarks, OptionAllowNetwork, OptionDownloadLogs, OptionAllowRedirects, OptionClientCert, OptionFailsafe, OptionSyncFolder, OptionDeleteAccount, OptionSyncStrategy, OptionResetCache, OptionSyncInterval, OptionNestedSync, OptionFileType, OptionPassphrase },
+  props: ['url', 'username', 'password','passphrase', 'includeCredentials', 'serverRoot', 'localRoot', 'allowNetwork', 'syncInterval', 'strategy', 'bookmark_file', 'nestedSync', 'failsafe', 'allowRedirects', 'bookmark_file_type', 'enabled', 'label'],
   data() {
     return {
       panels: [0, 1],

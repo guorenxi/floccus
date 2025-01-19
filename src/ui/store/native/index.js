@@ -5,14 +5,11 @@ import { actionsDefinition } from './actions'
 
 Vue.use(Vuex)
 
-export { mutations, actions } from '../definitions'
-
 export default new Store({
   mutations: mutationsDefinition,
   actions: actionsDefinition,
   state: {
     locked: false,
-    secured: false,
     accounts: {},
     tree: null,
     loginFlow: {

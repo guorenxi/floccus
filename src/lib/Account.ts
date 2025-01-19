@@ -1,30 +1,42 @@
 import AdapterFactory from './AdapterFactory'
 import Logger from './Logger'
-import { Folder, ItemLocation } from './Tree'
+import { ItemLocation, TItemLocation } from './Tree'
 import UnidirectionalSyncProcess from './strategies/Unidirectional'
 import MergeSyncProcess from './strategies/Merge'
 import DefaultSyncProcess from './strategies/Default'
 import IAccountStorage, { IAccountData, TAccountStrategy } from './interfaces/AccountStorage'
 import { TAdapter } from './interfaces/Adapter'
-import { IResource, TLocalTree } from './interfaces/Resource'
-import Controller from './Controller'
-import { Device } from '@capacitor/device'
+import { OrderFolderResource, TLocalTree } from './interfaces/Resource'
+import { Capacitor } from '@capacitor/core'
 import IAccount from './interfaces/Account'
 import Mappings from './Mappings'
+import { isTest } from './isTest'
+import CachingAdapter from './adapters/Caching'
+import * as Sentry from '@sentry/vue'
+
+declare const DEBUG: boolean
 
 // register Adapters
+AdapterFactory.register('linkwarden', async() => (await import('./adapters/Linkwarden')).default)
 AdapterFactory.register('nextcloud-folders', async() => (await import('./adapters/NextcloudBookmarks')).default)
 AdapterFactory.register('nextcloud-bookmarks', async() => (await import('./adapters/NextcloudBookmarks')).default)
 AdapterFactory.register('webdav', async() => (await import('./adapters/WebDav')).default)
+AdapterFactory.register('git', async() => (await import('./adapters/Git')).default)
 AdapterFactory.register('google-drive', async() => (await import('./adapters/GoogleDrive')).default)
 AdapterFactory.register('fake', async() => (await import('./adapters/Fake')).default)
+
+// 2h
+const LOCK_TIMEOUT = 1000 * 60 * 60 * 2
 
 export default class Account {
   static cache = {}
   static singleton : IAccount
 
   static async getAccountClass(): Promise<IAccount> {
-    if ((await Device.getInfo()).platform === 'web') {
+    if (this.singleton) {
+      return this.singleton
+    }
+    if (Capacitor.getPlatform() === 'web') {
       this.singleton = (await import('./browser/BrowserAccount')).default
     } else {
       this.singleton = (await import('./native/NativeAccount')).default
@@ -65,12 +77,14 @@ export default class Account {
   protected server: TAdapter
   protected localTree: TLocalTree
   protected localTabs: TLocalTree
+  protected lockTimeout: number
 
   constructor(id:string, storageAdapter:IAccountStorage, serverAdapter: TAdapter, treeAdapter:TLocalTree) {
     this.server = serverAdapter
     this.id = id
     this.storage = storageAdapter
     this.localTree = treeAdapter
+    this.lockTimeout = LOCK_TIMEOUT
   }
 
   async delete():Promise<void> {
@@ -89,6 +103,9 @@ export default class Account {
       nestedSync: false,
       failsafe: true,
       allowNetwork: false,
+      label: '',
+      errorCount: 0,
+      clickCountEnabled: false,
     }
     const data = Object.assign(defaults, this.server.getData())
     if (data.type === 'nextcloud-folders') {
@@ -97,19 +114,16 @@ export default class Account {
     return data
   }
 
-  async getResource():Promise<IResource> {
-    if (this.getData().localRoot !== 'tabs') {
-      return this.localTree
-    } else {
-      const LocalTabs = (await import('./LocalTabs')).default
-      this.localTabs = new LocalTabs(this.storage)
-      return this.localTabs
-    }
+  async getResource():Promise<OrderFolderResource<typeof ItemLocation.LOCAL>> {
+    return this.localTree
+  }
+
+  async getServer():Promise<TAdapter> {
+    return this.server
   }
 
   async setData(data:IAccountData):Promise<void> {
-    const controller = await Controller.getSingleton()
-    await this.storage.setAccountData(data, controller.key)
+    await this.storage.setAccountData(data, null)
     this.server.setData(data)
   }
 
@@ -120,9 +134,14 @@ export default class Account {
   async tracksBookmark(localId:string):Promise<boolean> {
     if (!(await this.isInitialized())) return false
     const mappings = await this.storage.getMappings()
-    return Object.keys(mappings.getSnapshot().LocalToServer.bookmark).some(
-      (id) => localId === id
+    const snapshot = mappings.getSnapshot()
+    const foundBookmark = Object.keys(snapshot.LocalToServer.bookmark).some(
+      (id) => String(localId) === String(id)
     )
+    const foundFolder = Object.keys(snapshot.LocalToServer.folder).some(
+      (id) => String(localId) === String(id)
+    )
+    return foundBookmark || foundFolder
   }
 
   async init():Promise<void> {
@@ -133,31 +152,55 @@ export default class Account {
     throw new Error('Not implemented')
   }
 
-  async sync(strategy?:TAccountStrategy):Promise<void> {
+  async sync(strategy?:TAccountStrategy, forceSync = false):Promise<void> {
     let mappings: Mappings
     try {
       if (this.getData().syncing || this.syncing) return
 
+      const localResource = await this.getResource()
+      if (!(await this.server.isAvailable()) || !(await localResource.isAvailable())) return
+
       Logger.log('Starting sync process for account ' + this.getLabel())
+      Sentry.setUser({ id: this.id })
       this.syncing = true
-      await this.setData({ ...this.getData(), syncing: 0.05, error: null })
+      await this.setData({ ...this.getData(), syncing: 0.05, scheduled: false, error: null })
 
       if (!(await this.isInitialized())) {
         await this.init()
       }
 
-      let localResource
-      if (this.getData().localRoot !== 'tabs') {
-        localResource = this.localTree
-      } else {
-        const LocalTabs = (await import('./LocalTabs')).default
-        this.localTabs = new LocalTabs(this.storage)
-        localResource = this.localTabs
-      }
-
       if (this.server.onSyncStart) {
         const needLock = (strategy || this.getData().strategy) !== 'slave'
-        const status = await this.server.onSyncStart(needLock)
+        let status
+        try {
+          status = await this.server.onSyncStart(needLock, forceSync)
+        } catch (e) {
+          // Resource locked
+          if (e.code === 37) {
+            // We got a resource locked error
+            if (this.getData().lastSync < Date.now() - this.lockTimeout || forceSync) {
+              // but if we've been waiting for the lock for more than 2h
+              // start again without locking the resource
+              status = await this.server.onSyncStart(false, true)
+            } else {
+              await this.setData({
+                ...this.getData(),
+                error: null,
+                syncing: false,
+                scheduled: strategy || this.getData().strategy
+              })
+              this.syncing = false
+              Logger.log(
+                'Resource is locked, trying again soon'
+              )
+              await Logger.persist()
+              return
+            }
+          } else {
+            await this.server.onSyncFail()
+            throw e
+          }
+        }
         if (status === false) {
           await this.init()
         }
@@ -165,54 +208,82 @@ export default class Account {
 
       // main sync steps:
       mappings = await this.storage.getMappings()
-      const cacheTree = localResource.constructor.name !== 'LocalTabs' ? await this.storage.getCache() : new Folder({title: '', id: 'tabs', location: ItemLocation.LOCAL})
+      const cacheTree = await this.storage.getCache()
 
-      let strategyClass, direction
-      switch (strategy || this.getData().strategy) {
-        case 'slave':
-          Logger.log('Using "merge slave" strategy (no cache available)')
-          strategyClass = UnidirectionalSyncProcess
-          direction = ItemLocation.LOCAL
-          break
-        case 'overwrite':
-          Logger.log('Using "merge overwrite" strategy (no cache available)')
-          strategyClass = UnidirectionalSyncProcess
-          direction = ItemLocation.SERVER
-          break
-        default:
-          if (!cacheTree.children.length) {
-            Logger.log('Using "merge default" strategy (no cache available)')
-            strategyClass = MergeSyncProcess
-          } else {
-            Logger.log('Using "default" strategy')
-            strategyClass = DefaultSyncProcess
-          }
-          break
-      }
+      let continuation = await this.storage.getCurrentContinuation()
 
-      this.syncProcess = new strategyClass(
-        mappings,
-        localResource,
-        cacheTree,
-        this.server,
-        (progress) => {
-          this.setData({ ...this.getData(), syncing: progress })
+      if (typeof continuation !== 'undefined' && continuation !== null) {
+        try {
+          this.syncProcess = await DefaultSyncProcess.fromJSON(
+            mappings,
+            localResource,
+            this.server,
+            async(progress, actionDone) => {
+              await this.progressCallback(progress, actionDone)
+            },
+            continuation
+          )
+        } catch (e) {
+          continuation = null
+          Logger.log('Failed to load pending continuation. Continuing with normal sync')
         }
-      )
-      if (direction) {
-        this.syncProcess.setDirection(direction)
       }
-      await this.syncProcess.sync()
 
-      await this.setData({ ...this.getData(), syncing: 1 })
+      if (typeof continuation === 'undefined' || continuation === null || (typeof strategy !== 'undefined' && continuation.strategy !== strategy) || Date.now() - continuation.createdAt > 1000 * 60 * 30) {
+        // If there is no pending continuation, we just sync normally
+        // Same if the pending continuation was overridden by a different strategy
+        // same if the continuation is older than half an hour. We don't want old zombie continuations
+
+        let strategyClass: typeof DefaultSyncProcess|typeof MergeSyncProcess|typeof UnidirectionalSyncProcess, direction: TItemLocation
+        switch (strategy || this.getData().strategy) {
+          case 'slave':
+            Logger.log('Using "merge slave" strategy (no cache available)')
+            strategyClass = UnidirectionalSyncProcess
+            direction = ItemLocation.LOCAL
+            break
+          case 'overwrite':
+            Logger.log('Using "merge overwrite" strategy (no cache available)')
+            strategyClass = UnidirectionalSyncProcess
+            direction = ItemLocation.SERVER
+            break
+          default:
+            if (!cacheTree.children.length) {
+              Logger.log('Using "merge default" strategy (no cache available)')
+              strategyClass = MergeSyncProcess
+            } else {
+              Logger.log('Using "default" strategy')
+              strategyClass = DefaultSyncProcess
+            }
+            break
+        }
+
+        this.syncProcess = new strategyClass(
+          mappings,
+          localResource,
+          this.server,
+          async(progress, actionsDone?) => {
+            await this.progressCallback(progress, actionsDone)
+          }
+        )
+        this.syncProcess.setCacheTree(cacheTree)
+        if (direction) {
+          this.syncProcess.setDirection(direction)
+        }
+        await this.syncProcess.sync()
+      } else {
+        // if there is a pending continuation, we resume it
+
+        Logger.log('Found existing persisted pending continuation. Resuming last sync')
+        await this.syncProcess.sync()
+      }
+
+      await this.setData({ ...this.getData(), scheduled: false, syncing: 1 })
 
       // update cache
-      if (localResource.constructor.name !== 'LocalTabs') {
-        const cache = (await localResource.getBookmarksTree()).clone(false)
-        this.syncProcess.filterOutUnacceptedBookmarks(cache)
-        this.syncProcess.filterOutUnmappedItems(cache, await mappings.getSnapshot())
-        await this.storage.setCache(cache)
-      }
+      const cache = (await localResource.getBookmarksTree()).clone(false)
+      this.syncProcess.filterOutUnacceptedBookmarks(cache)
+      this.syncProcess.filterOutUnmappedItems(cache, await mappings.getSnapshot())
+      await this.storage.setCache(cache)
 
       if (this.server.onSyncComplete) {
         await this.server.onSyncComplete()
@@ -224,10 +295,13 @@ export default class Account {
 
       this.syncing = false
 
+      await this.storage.setCurrentContinuation(null)
       await this.setData({
         ...this.getData(),
         error: null,
+        errorCount: 0,
         syncing: false,
+        scheduled: false,
         lastSync: Date.now(),
       })
 
@@ -239,12 +313,28 @@ export default class Account {
       const message = await Account.stringifyError(e)
       console.error('Syncing failed with', message)
       Logger.log('Syncing failed with', message)
+      Sentry.setContext('accountData', {
+        ...this.getData(),
+        username: 'SENSITIVEVALUEHIDDEN',
+        password: 'SENSITIVEVALUVALUEHIDDEN',
+        passphrase: 'SENSITIVEVALUVALUEHIDDEN'
+      })
+      if (e.list) {
+        Sentry.captureException(message)
+      } else {
+        Sentry.captureException(e)
+      }
 
       await this.setData({
         ...this.getData(),
         error: message,
+        errorCount: this.getData().errorCount + 1,
         syncing: false,
+        scheduled: false,
       })
+      if (matchAllErrors(e, e => e.code !== 27 && (!isTest || e.code !== 26))) {
+        await this.storage.setCurrentContinuation(null)
+      }
       this.syncing = false
       if (this.server.onSyncFail) {
         await this.server.onSyncFail()
@@ -252,7 +342,7 @@ export default class Account {
 
       // reset cache and mappings after error
       // (but not after interruption or NetworkError)
-      if (matchAllErrors(e, e => e.code !== 27 && e.code !== 17)) {
+      if (matchAllErrors(e, e => e.code !== 27 && e.code !== 17 && (!isTest || e.code !== 26))) {
         await this.init()
       }
     }
@@ -268,6 +358,20 @@ export default class Account {
     this.server.cancel()
     if (this.syncProcess) {
       await this.syncProcess.cancel()
+    }
+  }
+
+  private async progressCallback(progress: number, actionsDone: number) {
+    if (!this.syncing) {
+      return
+    }
+    await this.setData({ ...this.getData(), syncing: progress })
+    if (!this.syncProcess) {
+      return
+    }
+    if (actionsDone && (!(this.server instanceof CachingAdapter) || !('onSyncComplete' in this.server))) {
+      await this.storage.setCurrentContinuation(this.syncProcess.toJSON())
+      await this.syncProcess.getMappingsInstance().persist()
     }
   }
 

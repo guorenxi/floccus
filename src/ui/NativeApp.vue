@@ -8,7 +8,7 @@
 
 <script>
 import { version as VERSION } from '../../package.json'
-import { actions } from './store/native'
+import { actions } from './store/definitions'
 import Controller from '../lib/Controller'
 export default {
   name: 'NativeApp',
@@ -23,11 +23,8 @@ export default {
     locked() {
       return false
     },
-    secured() {
-      return false
-    },
     background() {
-      return this.$vuetify.theme.dark ? '#000' : '#fff'
+      return this.$vuetify.theme.dark ? '#000000' : '#ffffff'
     }
   },
   async created() {
@@ -35,6 +32,7 @@ export default {
       this.$store.dispatch(actions.LOAD_ACCOUNTS)
     }, 5000)
     const controller = await Controller.getSingleton()
+    await controller.onLoad()
     controller.onStatusChange(() => {
       this.$store.dispatch(actions.LOAD_ACCOUNTS)
     })
@@ -48,8 +46,18 @@ body {
   padding-left: env(safe-area-inset-left);
   padding-right: env(sage-area-inset-right);
   background: v-bind(background);
+  font-size: 0.45cm !important;
+}
+@media (prefers-color-scheme: dark) {
+  html {
+    background-color: #000000;
+  }
+}
+html {
+  font-size: 0.45cm !important;
 }
 .v-navigation-drawer {
   top: env(safe-area-inset-top) !important;
+  bottom: 0;
 }
 </style>

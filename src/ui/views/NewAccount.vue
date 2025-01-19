@@ -5,6 +5,10 @@
       <v-stepper v-model="currentStep">
         <v-stepper-header>
           <v-stepper-step
+            :complete="currentStep > 0"
+            step="0" />
+          <v-divider />
+          <v-stepper-step
             :complete="currentStep > 1"
             step="1" />
           <v-divider />
@@ -22,7 +26,7 @@
         </v-stepper-header>
 
         <v-stepper-items>
-          <v-stepper-content step="1">
+          <v-stepper-content step="0">
             <div class="headline">
               {{ t('LabelChooseadapter') }}
             </div>
@@ -48,15 +52,42 @@
             <div class="d-flex flex-row-reverse">
               <v-btn
                 class="primary"
-                @click="currentStep = 2">
+                @click="currentStep++">
                 {{ t('LabelContinue') }}
               </v-btn>
               <v-btn
-                v-if="isBrowser"
                 :to="{ name: 'IMPORTEXPORT' }"
                 class="mr-2">
                 <v-icon>mdi-export</v-icon>
-                {{ t('LabelImportExport') }}
+                <template v-if="isBrowser && true">
+                  {{ t('LabelImportExport') }}
+                </template>
+              </v-btn>
+            </div>
+          </v-stepper-content>
+
+          <v-stepper-content step="1">
+            <div class="headline">
+              {{ t('LabelAccountlabel') }}
+            </div>
+            <v-form>
+              <v-text-field
+                v-model="label"
+                append-icon="mdi-label"
+                class="mt-2 mb-4"
+                :label="t('LabelAccountlabel')"
+                :hint="t('DescriptionAccountlabel')"
+                :persistent-hint="true"
+                @keydown.enter.prevent="currentStep++" />
+            </v-form>
+            <div class="d-flex flex-row justify-space-between">
+              <v-btn @click="currentStep--">
+                {{ t('LabelBack') }}
+              </v-btn>
+              <v-btn
+                class="primary"
+                @click="currentStep++">
+                {{ t('LabelContinue') }}
               </v-btn>
             </div>
           </v-stepper-content>
@@ -109,6 +140,38 @@
               </div>
             </template>
 
+            <template v-else-if="adapter === 'linkwarden'">
+              <div class="headline">
+                {{ t('LabelServersetup') }}
+              </div>
+              <v-text-field
+                v-model="server"
+                :rules="[validateUrl]"
+                :label="t('LabelLinkwardenurl')"
+                :loading="isServerTestRunning"
+                :error-messages="serverTestError || serverisNotHttps" />
+              <v-text-field
+                v-model="username"
+                :label="t('LabelUsername')" />
+              <v-text-field
+                v-model="password"
+                :label="t('LabelAccesstoken')"
+                :append-icon="showPassword ? 'mdi-eye' : 'mdi-eye-off'"
+                :type="showPassword ? 'text' : 'password'"
+                @click:append="showPassword = !showPassword" />
+
+              <div class="d-flex flex-row justify-space-between">
+                <v-btn @click="currentStep--">
+                  {{ t('LabelBack') }}
+                </v-btn>
+                <v-btn
+                  class="primary"
+                  @click="testLinkwardenServer">
+                  {{ t('LabelContinue') }}
+                </v-btn>
+              </div>
+            </template>
+
             <template v-else-if="adapter === 'webdav'">
               <div class="headline">
                 {{ t('LabelServersetup') }}
@@ -144,6 +207,35 @@
                 <v-btn
                   class="primary"
                   @click="testWebdavServer">
+                  {{ t('LabelContinue') }}
+                </v-btn>
+              </div>
+            </template>
+
+            <template v-else-if="adapter === 'git'">
+              <div class="headline">
+                {{ t('LabelServersetup') }}
+              </div>
+              <v-text-field
+                v-model="server"
+                :rules="[validateUrl]"
+                :label="t('LabelGiturl')" />
+              <v-text-field
+                v-model="username"
+                :label="t('LabelUsername')" />
+              <v-text-field
+                v-model="password"
+                :label="t('LabelPassword')"
+                :append-icon="showPassword ? 'mdi-eye' : 'mdi-eye-off'"
+                :type="showPassword ? 'text' : 'password'"
+                @click:append="showPassword = !showPassword" />
+              <div class="d-flex flex-row justify-space-between">
+                <v-btn @click="currentStep--">
+                  {{ t('LabelBack') }}
+                </v-btn>
+                <v-btn
+                  class="primary"
+                  @click="currentStep++">
                   {{ t('LabelContinue') }}
                 </v-btn>
               </div>
@@ -186,6 +278,18 @@
                 :label="t('LabelServerfolder')" />
             </template>
 
+            <template v-if="adapter === 'linkwarden'">
+              <div class="text-h6">
+                {{ t('LabelServerfolder') }}
+              </div>
+              <div class="caption">
+                {{ t('DescriptionServerfolderlinkwarden') }}
+              </div>
+              <v-text-field
+                v-model="serverFolder"
+                :label="t('LabelServerfolder')" />
+            </template>
+
             <template v-if="adapter === 'webdav'">
               <div class="text-h6">
                 {{ t('LabelBookmarksfile') }}
@@ -200,6 +304,26 @@
                 :persistent-hint="true" />
               <OptionFileType
                 v-model="bookmark_file_type" />
+            </template>
+
+            <template v-if="adapter === 'git'">
+              <div class="text-h6">
+                {{ t('LabelBookmarksfile') }}
+              </div>
+              <v-text-field
+                v-model="bookmark_file"
+                class="mb-2"
+                append-icon="mdi-file-document"
+                :rules="[validateBookmarksFile]"
+                :label="t('LabelBookmarksfile')"
+                :hint="t('DescriptionBookmarksfilegit')"
+                :persistent-hint="true" />
+              <OptionFileType
+                v-model="bookmark_file_type" />
+              <v-text-field
+                v-model="branch"
+                class="mb-2"
+                :label="t('LabelGitbranch')" />
             </template>
 
             <template v-if="adapter === 'google-drive'">
@@ -223,6 +347,7 @@
                 :persistent-hint="true"
                 @click:append="showPassphrase = !showPassphrase" />
             </template>
+
             <OptionSyncFolder
               v-if="isBrowser"
               v-model="localRoot" />
@@ -245,20 +370,28 @@
               {{ t('LabelSyncbehaviorsetup') }}
             </div>
             <v-switch
-              v-if="isBrowser"
               v-model="enabled"
               :aria-label="t('LabelAutosync')"
               :label="t('LabelAutosync')"
               dense
               class="mt-0 pt-0" />
             <OptionSyncInterval
-              v-if="isBrowser && enabled"
+              v-if="enabled"
               v-model="syncInterval" />
             <OptionSyncStrategy
               v-model="strategy" />
             <OptionNestedSync
               v-if="isBrowser"
               v-model="nestedSync" />
+            <v-switch
+              v-if="adapter === 'nextcloud-bookmarks'"
+              v-model="clickCountEnabled"
+              :aria-label="t('LabelClickcount')"
+              :label="t('LabelClickcount')"
+              :hint="t('DescriptionClickcount')"
+              :persistent-hint="true"
+              dense
+              class="mt-0 pt-0 mb-4" />
 
             <div class="d-flex flex-row justify-space-between">
               <v-btn @click="currentStep--">
@@ -274,6 +407,9 @@
           <v-stepper-content step="5">
             <div class="headline">
               {{ t('LabelAccountcreated') }} <v-icon>mdi-check</v-icon>
+            </div>
+            <div v-if="isBrowser">
+              {{ t('DescriptionAccountcreated') }}
             </div>
           </v-stepper-content>
         </v-stepper-items>
@@ -295,18 +431,20 @@ export default {
   components: { OptionFileType, OptionNestedSync, OptionSyncStrategy, OptionSyncInterval, OptionSyncFolder },
   data() {
     return {
-      currentStep: 1,
+      currentStep: 0,
       isServerTestRunning: false,
       serverTestError: '',
       serverTestSuccessful: false,
       loginFlowError: '',
       server: 'https://',
+      branch: 'main',
       username: '',
       password: '',
       passphrase: '',
       refreshToken: '',
       bookmark_file: 'bookmarks.xbel',
       bookmark_file_type: 'xbel',
+      serverFolder: 'Floccus',
       serverRoot: '',
       localRoot: null,
       syncInterval: 15,
@@ -315,6 +453,8 @@ export default {
       nestedSync: true,
       showPassword: false,
       showPassphrase: false,
+      clickCountEnabled: false,
+      label: '',
       adapter: 'nextcloud-bookmarks',
       adapters: [
         {
@@ -323,9 +463,19 @@ export default {
           description: this.t('DescriptionAdapternextcloudfolders')
         },
         {
+          type: 'linkwarden',
+          label: this.t('LabelAdapterlinkwarden'),
+          description: this.t('DescriptionAdapterlinkwarden')
+        },
+        {
           type: 'webdav',
           label: this.t('LabelAdapterwebdav'),
           description: this.t('DescriptionAdapterwebdav')
+        },
+        {
+          type: 'git',
+          label: this.t('LabelAdaptergit'),
+          description: this.t('DescriptionAdaptergit')
         },
         {
           type: 'google-drive',
@@ -343,6 +493,13 @@ export default {
       return !this.server.startsWith('https') ? this.t('DescriptionNonhttps') : ''
     }
   },
+  watch: {
+    clickCountEnabled() {
+      if (this.clickCountEnabled) {
+        this.requestHistoryPermissions()
+      }
+    }
+  },
   backButton() {
     this.$router.push({ name: 'HOME' })
   },
@@ -354,10 +511,15 @@ export default {
         username: this.username,
         password: this.password,
         enabled: this.enabled,
-        ...(this.adapter === 'nextcloud-bookmarks' && {serverRoot: this.serverRoot}),
-        ...((this.adapter === 'webdav' || this.adapter === 'google-drive') && {bookmark_file: this.bookmark_file}),
+        label: this.label,
+        ...(this.adapter === 'nextcloud-bookmarks' && {serverRoot: this.serverRoot, clickCountEnabled: this.clickCountEnabled}),
+        ...(this.adapter === 'linkwarden' && {serverFolder: this.serverFolder}),
+        ...(this.adapter === 'git' && {branch: this.branch}),
+        ...((this.adapter === 'webdav' || this.adapter === 'google-drive' || this.adapter === 'git') && {bookmark_file: this.bookmark_file}),
+        ...((this.adapter === 'webdav' || this.adapter === 'google-drive' || this.adapter === 'git') && {bookmark_file_type: this.bookmark_file_type}),
         ...(this.adapter === 'google-drive' && {refreshToken: this.refreshToken}),
         ...(this.passphrase && {passphrase: this.passphrase}),
+        ...(this.adapter === 'google-drive' && this.passphrase && {password: this.passphrase}),
         ...(this.isBrowser && {localRoot: this.localRoot}),
         syncInterval: this.syncInterval,
         strategy: this.strategy,
@@ -382,6 +544,18 @@ export default {
       }
       this.isServerTestRunning = false
     },
+    async testLinkwardenServer() {
+      this.isServerTestRunning = true
+      this.serverTestError = ''
+      try {
+        await this.$store.dispatch(actions.TEST_LINKWARDEN_SERVER, {rootUrl: this.server, username: this.username, token: this.password})
+        this.serverTestSuccessful = true
+        this.currentStep++
+      } catch (e) {
+        this.serverTestError = e.message
+      }
+      this.isServerTestRunning = false
+    },
     async testWebdavServer() {
       this.isServerTestRunning = true
       this.serverTestError = ''
@@ -395,6 +569,9 @@ export default {
       this.isServerTestRunning = false
     },
     async loginGoogleDrive() {
+      if (this.isBrowser) {
+        await this.$store.dispatch(actions.REQUEST_NETWORK_PERMISSIONS)
+      }
       const GoogleDriveAdapter = (await import('../../lib/adapters/GoogleDrive')).default
       const { refresh_token, username } = await GoogleDriveAdapter.authorize()
       if (refresh_token) {
@@ -435,6 +612,9 @@ export default {
     validateBookmarksFileGoogle(path) {
       return !path.includes('/')
     },
+    requestHistoryPermissions() {
+      this.$store.dispatch(actions.REQUEST_HISTORY_PERMISSIONS)
+    }
   }
 }
 </script>

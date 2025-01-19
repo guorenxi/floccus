@@ -1,11 +1,9 @@
-import { Storage } from '@capacitor/storage'
+import { Preferences as Storage } from '@capacitor/preferences'
 import { Network } from '@capacitor/network'
 import Cryptography from '../Crypto'
 import NativeAccountStorage from './NativeAccountStorage'
-
-import PQueue from 'p-queue'
 import Account from '../Account'
-import onwakeup from 'onwakeup'
+import { STATUS_ALLGOOD, STATUS_DISABLED, STATUS_ERROR, STATUS_SYNCING } from '../interfaces/Controller'
 
 const INACTIVITY_TIMEOUT = 1000 * 7
 const DEFAULT_SYNC_INTERVAL = 15
@@ -14,10 +12,10 @@ class AlarmManager {
   constructor(ctl) {
     this.ctl = ctl
     this.backgroundSyncEnabled = true
-    setInterval(() => this.checkSync(), 60 * 1000)
+    setInterval(() => this.checkSync(), 25 * 1000)
 
     Network.addListener('networkStatusChange', status => {
-      if (status.connected && status.connectionType === 'wifi') {
+      if (status.connected) {
         this.backgroundSyncEnabled = true
       } else {
         this.backgroundSyncEnabled = false
@@ -33,12 +31,14 @@ class AlarmManager {
     for (let accountId of accounts) {
       const account = await Account.get(accountId)
       const data = account.getData()
+      if (data.scheduled) {
+        this.ctl.scheduleSync(accountId)
+      }
       if (
         !data.lastSync ||
         Date.now() >
         (data.syncInterval || DEFAULT_SYNC_INTERVAL) * 1000 * 60 + data.lastSync
       ) {
-        // noinspection ES6MissingAwait
         this.ctl.scheduleSync(accountId)
       }
     }
@@ -47,15 +47,10 @@ class AlarmManager {
 
 export default class NativeController {
   constructor() {
-    this.jobs = new PQueue({ concurrency: 1 })
-    this.waiting = {}
     this.schedule = {}
     this.listeners = []
 
     this.alarms = new AlarmManager(this)
-
-    // Set up onWakeup
-    onwakeup(() => this.onWakeup())
 
     // lock accounts when locking is enabled
 
@@ -70,26 +65,6 @@ export default class NativeController {
 
   setEnabled(enabled) {
     this.enabled = enabled
-  }
-
-  async setKey(key) {
-    let accounts = await Account.getAllAccounts()
-    await Promise.all(accounts.map(a => a.updateFromStorage()))
-    this.key = key
-    let hashedKey = await Cryptography.sha256(key)
-    let encryptedHash = await Cryptography.encryptAES(
-      key,
-      hashedKey,
-      'FLOCCUS'
-    )
-    await Storage.set({ key: 'accountsLocked', value: encryptedHash })
-    if (accounts.length) {
-      await Promise.all(accounts.map(a => a.setData(a.getData())))
-    }
-
-    // ...aand unlock it immediately.
-    this.unlocked = true
-    this.setEnabled(true)
   }
 
   async unlock(key) {
@@ -111,15 +86,15 @@ export default class NativeController {
     this.setEnabled(true)
   }
 
-  async unsetKey() {
-    if (!this.unlocked) {
-      throw new Error('Cannot disable encryption without unlocking first')
+  getUnlocked() {
+    return Promise.resolve(this.unlocked)
+  }
+
+  async scheduleAll() {
+    const accounts = await Account.getAllAccounts()
+    for (const account of accounts) {
+      this.scheduleSync(account.id)
     }
-    let accounts = await Account.getAllAccounts()
-    await Promise.all(accounts.map(a => a.updateFromStorage()))
-    this.key = null
-    await Storage.set({ key: 'accountsLocked', value: null })
-    await Promise.all(accounts.map(a => a.setData(a.getData())))
   }
 
   async scheduleSync(accountId, wait) {
@@ -138,17 +113,22 @@ export default class NativeController {
     if (account.getData().syncing) {
       return
     }
-    if (!account.getData().enabled) {
+    // if the account is already scheduled, don't prevent it, to avoid getting stuck
+    if (!account.getData().enabled && !account.getData().scheduled) {
       return
     }
 
-    if (this.waiting[accountId]) {
+    const status = await this.getStatus()
+    if (status === STATUS_SYNCING) {
+      await account.setData({ ...account.getData(), scheduled: account.getData().scheduled || true })
       return
     }
 
-    this.waiting[accountId] = true
-
-    return this.jobs.add(() => this.syncAccount(accountId))
+    if (account.getData().scheduled === true) {
+      await this.syncAccount(accountId)
+    } else {
+      await this.syncAccount(accountId, account.getData().scheduled)
+    }
   }
 
   async cancelSync(accountId, keepEnabled) {
@@ -160,8 +140,7 @@ export default class NativeController {
     await account.cancelSync()
   }
 
-  async syncAccount(accountId, strategy) {
-    this.waiting[accountId] = false
+  async syncAccount(accountId, strategy, forceSync = false) {
     if (!this.enabled) {
       return
     }
@@ -171,7 +150,7 @@ export default class NativeController {
     }
     setTimeout(() => this.updateStatus(), 500)
     try {
-      await account.sync(strategy)
+      await account.sync(strategy, forceSync)
     } catch (error) {
       console.error(error)
     }
@@ -180,6 +159,31 @@ export default class NativeController {
 
   async updateStatus() {
     this.listeners.forEach(fn => fn())
+  }
+
+  async getStatus() {
+    if (!this.unlocked) {
+      return STATUS_ERROR
+    }
+    const accounts = await Account.getAllAccounts()
+    let overallStatus = accounts.reduce((status, account) => {
+      const accData = account.getData()
+      if (status === STATUS_SYNCING || accData.syncing) {
+        return STATUS_SYNCING
+      } else if (status === STATUS_ERROR || (accData.error && !accData.syncing)) {
+        return STATUS_ERROR
+      } else {
+        return STATUS_ALLGOOD
+      }
+    }, STATUS_ALLGOOD)
+
+    if (overallStatus === STATUS_ALLGOOD) {
+      if (accounts.every(account => !account.getData().enabled)) {
+        overallStatus = STATUS_DISABLED
+      }
+    }
+
+    return overallStatus
   }
 
   onStatusChange(listener) {
@@ -200,18 +204,9 @@ export default class NativeController {
           await acc.setData({
             ...acc.getData(),
             syncing: false,
-            error: false,
+            scheduled: false,
           })
         }
-      })
-    )
-  }
-
-  async onWakeup() {
-    const accounts = await Account.getAllAccounts()
-    await Promise.all(
-      accounts.map(async acc => {
-        await acc.cancelSync()
       })
     )
   }

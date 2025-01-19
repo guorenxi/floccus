@@ -40,6 +40,7 @@
       <v-container class="d-flex flex-row pa-0">
         <v-btn
           class="flex-grow-1 me-1"
+          color="primary"
           :to="{ name: routes.NEW_ACCOUNT }"
           target="_blank">
           <v-icon>
@@ -48,10 +49,16 @@
           {{ t('LabelNewAccount') }}
         </v-btn>
         <v-btn
+          class="me-1"
           :title="t('LabelImportExport')"
           :to="{ name: routes.IMPORTEXPORT }"
           target="_blank">
           <v-icon>mdi-export</v-icon>
+        </v-btn>
+        <v-btn
+          :title="t('LabelSyncall')"
+          @click="clickSyncAll">
+          <v-icon>mdi-sync-circle</v-icon>
         </v-btn>
       </v-container>
     </template>
@@ -61,6 +68,7 @@
 <script>
 import AccountCard from '../components/AccountCard'
 import { routes } from '../router'
+import { actions } from '../store/definitions'
 
 export default {
   name: 'Overview',
@@ -74,6 +82,11 @@ export default {
     },
     loading() {
       return this.$store.state.loading.accounts
+    },
+  },
+  methods: {
+    clickSyncAll() {
+      this.$store.dispatch(actions.TRIGGER_SYNC_ALL)
     }
   }
 }
